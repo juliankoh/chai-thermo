@@ -24,7 +24,7 @@ def main():
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    from src.embeddings.chai_extractor import extract_trunk_embeddings
+    from src.embeddings.chai_extractor import ChaiTrunkExtractor, ChaiEmbeddings
 
     # Test with a small protein (47 aa)
     test_sequence = "EPELVFKVRVRTKDGRELEIEVSAEDLEKLLEALPDIEEVEIEEVEP"
@@ -33,10 +33,12 @@ def main():
     print(f"\nExtracting embeddings for test protein ({len(test_sequence)} aa)...")
     print(f"Sequence: {test_sequence[:30]}...")
 
-    embeddings = extract_trunk_embeddings(
+    # Create extractor (loads models once, keeps in VRAM)
+    extractor = ChaiTrunkExtractor(device="cuda:0")
+
+    embeddings = extractor.extract(
         sequence=test_sequence,
         protein_name=test_name,
-        device="cuda:0",
         num_trunk_recycles=3,
         use_esm_embeddings=True,
     )
@@ -66,7 +68,7 @@ def main():
     print(f"\nSaved to {test_output}")
 
     # Test loading
-    loaded = embeddings.load(test_output)
+    loaded = ChaiEmbeddings.load(test_output)
     assert torch.allclose(embeddings.single, loaded.single)
     assert torch.allclose(embeddings.pair, loaded.pair)
     print("Load/save test passed!")
