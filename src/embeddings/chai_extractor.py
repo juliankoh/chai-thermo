@@ -8,9 +8,10 @@ Requires: Linux + CUDA GPU (A100/H100 recommended)
 
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Generator
 
 import torch
 from torch import Tensor
@@ -48,6 +49,25 @@ class ChaiEmbeddings:
         return cls(**data)
 
 
+# Cache for loaded model components
+_component_cache: dict = {}
+
+
+@contextmanager
+def _load_component(comp_key: str, device: torch.device) -> Generator:
+    """Load a model component, caching it for reuse."""
+    from chai_lab.chai1 import load_exported
+
+    if comp_key not in _component_cache:
+        _component_cache[comp_key] = load_exported(comp_key, device)
+
+    component = _component_cache[comp_key]
+    component.jit_module.to(device)
+    yield component
+    # Move back to CPU to free GPU memory
+    component.jit_module.to("cpu")
+
+
 def extract_trunk_embeddings(
     sequence: str,
     protein_name: str = "protein",
@@ -72,19 +92,17 @@ def extract_trunk_embeddings(
         ChaiEmbeddings with single [L, D_single] and pair [L, L, D_pair] tensors
     """
     import tempfile
-    import shutil
 
     # Import chai-lab components
     from chai_lab.chai1 import (
         make_all_atom_feature_context,
         feature_factory,
-        _component_moved_to,
         raise_if_too_many_tokens,
     )
     from chai_lab.data.collate.collate import Collate
     from chai_lab.data.collate.utils import AVAILABLE_MODEL_SIZES
     from chai_lab.data.features.generators.token_bond import TokenBondRestraint
-    from chai_lab.utils.tensor_utils import move_data_to_device, und_self
+    from chai_lab.utils.tensor_utils import und_self
 
     torch_device = torch.device(device)
 
@@ -147,7 +165,7 @@ def extract_trunk_embeddings(
     logger.info(f"Running feature embedding (model size: {model_size})")
 
     # === Feature Embedding ===
-    with _component_moved_to("feature_embedding.pt", torch_device) as feature_embedding:
+    with _load_component("feature_embedding.pt", torch_device) as feature_embedding:
         embedded_features = feature_embedding.forward(
             crop_size=model_size,
             move_to_device=torch_device,
@@ -171,7 +189,7 @@ def extract_trunk_embeddings(
     # === Bond Features ===
     bond_ft_gen = TokenBondRestraint()
     bond_ft = bond_ft_gen.generate(batch=batch).data
-    with _component_moved_to("bond_loss_input_proj.pt", torch_device) as bond_proj:
+    with _load_component("bond_loss_input_proj.pt", torch_device) as bond_proj:
         trunk_bond_feat, structure_bond_feat = bond_proj.forward(
             return_on_cpu=False,
             move_to_device=torch_device,
@@ -182,7 +200,7 @@ def extract_trunk_embeddings(
 
     # === Token Embedder ===
     logger.info("Running token embedder")
-    with _component_moved_to("token_embedder.pt", torch_device) as token_embedder:
+    with _load_component("token_embedder.pt", torch_device) as token_embedder:
         token_embedder_outputs = token_embedder.forward(
             return_on_cpu=False,
             move_to_device=torch_device,
@@ -208,7 +226,7 @@ def extract_trunk_embeddings(
     token_pair_trunk_repr = token_pair_initial_repr
 
     for recycle_idx in range(num_trunk_recycles):
-        with _component_moved_to("trunk.pt", torch_device) as trunk:
+        with _load_component("trunk.pt", torch_device) as trunk:
             token_single_trunk_repr, token_pair_trunk_repr = trunk.forward(
                 move_to_device=torch_device,
                 token_single_trunk_initial_repr=token_single_initial_repr,
