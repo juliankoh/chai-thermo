@@ -194,9 +194,9 @@ def extract_trunk_embeddings(
     template_input_feats = template_input_feats.to(torch.bfloat16)
     msa_input_feats = msa_input_feats.to(torch.bfloat16)
 
-    # === Bond Features ===
+    # === Bond Features (expects float32) ===
     bond_ft_gen = TokenBondRestraint()
-    bond_ft = bond_ft_gen.generate(batch=batch).data.to(torch.bfloat16)
+    bond_ft = bond_ft_gen.generate(batch=batch).data
     with _load_component("bond_loss_input_proj.pt", torch_device) as bond_proj:
         trunk_bond_feat, structure_bond_feat = bond_proj.forward(
             return_on_cpu=False,
@@ -204,6 +204,8 @@ def extract_trunk_embeddings(
             crop_size=model_size,
             input=bond_ft,
         ).chunk(2, dim=-1)
+    # Convert bond features to bfloat16 to match other features
+    trunk_bond_feat = trunk_bond_feat.to(torch.bfloat16)
     token_pair_input_feats = token_pair_input_feats + trunk_bond_feat
 
     # === Token Embedder ===
