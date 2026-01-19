@@ -137,9 +137,14 @@ class ChaiTrunkExtractor:
 
         # --- 3. Feature Embedding ---
         logger.info(f"Running feature embedding (model size: {model_size})")
-        embedded = self.feature_embedding(crop_size=model_size, **features)
+        embedded = self.feature_embedding.forward(
+            crop_size=model_size,
+            move_to_device=self.device,
+            return_on_cpu=False,
+            **features,
+        )
 
-        # Cast to bfloat16 immediately
+        # Cast to bfloat16
         tok_single = embedded["TOKEN"].to(self.dtype)
         tok_pair, _ = embedded["TOKEN_PAIR"].chunk(2, dim=-1)
         tok_pair = tok_pair.to(self.dtype)
@@ -147,17 +152,20 @@ class ChaiTrunkExtractor:
         atom_single = atom_single.to(self.dtype)
         block_atom_pair, _ = embedded["ATOM_PAIR"].chunk(2, dim=-1)
         block_atom_pair = block_atom_pair.to(self.dtype)
-        template_input_feats = embedded["TEMPLATES"].to(self.dtype)
-        msa_input_feats = embedded["MSA"].to(self.dtype)
 
         # --- 4. Bond Features ---
         bond_ft = self.bond_ft_gen.generate(batch=batch).data.to(self.device)
-        trunk_bond_feat, _ = self.bond_proj(crop_size=model_size, input=bond_ft).chunk(2, dim=-1)
+        trunk_bond_feat, _ = self.bond_proj.forward(
+            crop_size=model_size,
+            input=bond_ft,
+            move_to_device=self.device,
+            return_on_cpu=False,
+        ).chunk(2, dim=-1)
         tok_pair = tok_pair + trunk_bond_feat.to(self.dtype)
 
         # --- 5. Token Embedder ---
         logger.info("Running token embedder")
-        tok_single_curr, _, tok_pair_curr = self.token_embedder(
+        tok_single_curr, _, tok_pair_curr = self.token_embedder.forward(
             token_single_input_feats=tok_single,
             token_pair_input_feats=tok_pair,
             atom_single_input_feats=atom_single,
@@ -168,32 +176,26 @@ class ChaiTrunkExtractor:
             atom_single_mask=inputs["atom_exists_mask"],
             atom_token_indices=inputs["atom_token_index"].long(),
             crop_size=model_size,
+            move_to_device=self.device,
+            return_on_cpu=False,
         )
-
-        # Store initial repr for recycles
-        tok_single_initial = tok_single_curr
-        tok_pair_initial = tok_pair_curr
-
-        # Precompute masks
-        token_single_mask = inputs["token_exists_mask"]
-        token_pair_mask = und_self(token_single_mask, "b i, b j -> b i j")
-        template_input_masks = und_self(inputs["template_mask"], "b t n1, b t n2 -> b t n1 n2")
 
         # --- 6. Trunk Recycles ---
         logger.info(f"Running trunk ({num_trunk_recycles} recycles)")
         for _ in range(num_trunk_recycles):
-            tok_single_curr, tok_pair_curr = self.trunk(
-                token_single_trunk_initial_repr=tok_single_initial,
-                token_pair_trunk_initial_repr=tok_pair_initial,
+            tok_single_curr, tok_pair_curr = self.trunk.forward(
+                token_single_trunk_initial_repr=tok_single_curr,
+                token_pair_trunk_initial_repr=tok_pair_curr,
                 token_single_trunk_repr=tok_single_curr,
                 token_pair_trunk_repr=tok_pair_curr,
-                msa_input_feats=msa_input_feats,
+                msa_input_feats=embedded["MSA"].to(self.dtype),
                 msa_mask=inputs["msa_mask"],
-                template_input_feats=template_input_feats,
-                template_input_masks=template_input_masks,
-                token_single_mask=token_single_mask,
-                token_pair_mask=token_pair_mask,
+                template_input_feats=embedded["TEMPLATES"].to(self.dtype),
+                template_input_masks=und_self(inputs["template_mask"], "b t n1, b t n2 -> b t n1 n2"),
+                token_single_mask=inputs["token_exists_mask"],
+                token_pair_mask=und_self(inputs["token_exists_mask"], "b i, b j -> b i j"),
                 crop_size=model_size,
+                move_to_device=self.device,
             )
 
         # Return on CPU as float16 (saves disk space)
