@@ -122,9 +122,17 @@ class ChaiTrunkExtractor:
             )
 
         # --- 2. Move to GPU ---
+        # Note: batch contains mix of Tensors and Python lists (metadata)
+        # Only move Tensors to device
         batch = self.collator([feature_context])
-        features = {k: v.to(self.device) for k, v in batch["features"].items()}
-        inputs = {k: v.to(self.device) for k, v in batch["inputs"].items()}
+        features = {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch["features"].items()
+        }
+        inputs = {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch["inputs"].items()
+        }
         _, _, model_size = inputs["msa_mask"].shape
 
         # --- 3. Feature Embedding ---
