@@ -186,9 +186,17 @@ def extract_trunk_embeddings(
     template_input_feats = embedded_features["TEMPLATES"]
     msa_input_feats = embedded_features["MSA"]
 
+    # Convert to bfloat16 to match model weights
+    token_single_input_feats = token_single_input_feats.to(torch.bfloat16)
+    token_pair_input_feats = token_pair_input_feats.to(torch.bfloat16)
+    atom_single_input_feats = atom_single_input_feats.to(torch.bfloat16)
+    block_atom_pair_input_feats = block_atom_pair_input_feats.to(torch.bfloat16)
+    template_input_feats = template_input_feats.to(torch.bfloat16)
+    msa_input_feats = msa_input_feats.to(torch.bfloat16)
+
     # === Bond Features ===
     bond_ft_gen = TokenBondRestraint()
-    bond_ft = bond_ft_gen.generate(batch=batch).data
+    bond_ft = bond_ft_gen.generate(batch=batch).data.to(torch.bfloat16)
     with _load_component("bond_loss_input_proj.pt", torch_device) as bond_proj:
         trunk_bond_feat, structure_bond_feat = bond_proj.forward(
             return_on_cpu=False,
@@ -242,11 +250,11 @@ def extract_trunk_embeddings(
                 crop_size=model_size,
             )
 
-    # Extract embeddings (remove batch dimension, move to CPU)
+    # Extract embeddings (remove batch dimension, move to CPU, convert to float32)
     # token_single_trunk_repr: [1, L, D_single]
     # token_pair_trunk_repr: [1, L, L, D_pair]
-    single_emb = token_single_trunk_repr[0].cpu()  # [L, D_single]
-    pair_emb = token_pair_trunk_repr[0].cpu()  # [L, L, D_pair]
+    single_emb = token_single_trunk_repr[0].cpu().float()  # [L, D_single]
+    pair_emb = token_pair_trunk_repr[0].cpu().float()  # [L, L, D_pair]
 
     logger.info(f"Extracted embeddings: single={single_emb.shape}, pair={pair_emb.shape}")
 
