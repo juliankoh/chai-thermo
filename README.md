@@ -53,15 +53,25 @@ Labels are proper floats (`dG_ML`, `ddG_ML`), not strings.
 
 ### Label Semantics
 
-```
-ΔΔG = ΔG(mutant) − ΔG(wildtype)
+**⚠️ CRITICAL: MegaScale uses INVERTED sign convention in raw data!**
 
-Sign convention:
+```
+RAW MegaScale data (ddG_ML column):
+  ΔΔG = ΔG(wildtype) − ΔG(mutant)   ← INVERTED
+  - Positive ΔΔG = STABILIZING (lower mutant energy)
+  - Negative ΔΔG = DESTABILIZING (higher mutant energy)
+
+Evidence: Stabilizing_mut=True entries have POSITIVE ddG_ML values.
+
+STANDARD convention (what we use after loading):
+  ΔΔG = ΔG(mutant) − ΔG(wildtype)   ← STANDARD
   - Positive ΔΔG = destabilizing mutation
   - Negative ΔΔG = stabilizing mutation
 
 Units: kcal/mol
 ```
+
+**Our `MegaScaleDataset` class automatically flips the sign to standard convention.**
 
 ### Dataset Limitations (Know Your Bounds)
 

@@ -1,0 +1,40 @@
+# Default configuration for chai-thermo
+
+# Data settings
+data:
+  dataset_name: "RosettaCommons/MegaScale"
+  dataset_config: "dataset3_single_cv"
+  cache_dir: "data/processed/megascale_cv"
+  embeddings_dir: "data/embeddings/chai_full"
+
+# Feature extraction
+features:
+  k_structural: 10  # number of structural neighbors
+  seq_window: 5     # sequence window size
+
+# Model architecture
+model:
+  d_single: 384     # Chai-1 single representation dimension
+  d_pair: 128       # Chai-1 pair representation dimension
+  hidden_dim: 512
+  dropout: 0.1
+
+# Training
+training:
+  optimizer: "adamw"
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  batch_size: 128
+  epochs: 100
+  early_stopping_patience: 10
+  gradient_clip: 1.0
+  variants_per_protein: 8  # for balanced sampling
+
+# Loss
+loss:
+  type: "huber"  # "mse" or "huber"
+  huber_delta: 2.0
+
+# Evaluation
+evaluation:
+  min_mutations_per_protein: 30  # for Spearman calculation
