@@ -198,9 +198,10 @@ class ChaiTrunkExtractor:
                 move_to_device=self.device,
             )
 
-        # Return on CPU as float16 (saves disk space)
-        single_emb = tok_single_curr[0].cpu().half()
-        pair_emb = tok_pair_curr[0].cpu().half()
+        # Slice to remove padding (Chai pads to crop sizes like 256, 384, 512)
+        L = len(sequence)
+        single_emb = tok_single_curr[0, :L].cpu().half()  # [L, D_single]
+        pair_emb = tok_pair_curr[0, :L, :L].cpu().half()  # [L, L, D_pair]
 
         logger.info(f"Extracted embeddings: single={single_emb.shape}, pair={pair_emb.shape}")
 
