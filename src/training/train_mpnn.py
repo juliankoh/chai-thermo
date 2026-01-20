@@ -453,6 +453,28 @@ def train_cv(
 
     logger.info(f"Run directory: {run_dir}")
 
+    # Log hyperparameters
+    logger.info(f"\n{'=' * 50}")
+    logger.info("Hyperparameters")
+    logger.info(f"{'=' * 50}")
+    logger.info(f"  Model: {base_config.model_type}")
+    logger.info(f"  hidden_dim: {base_config.hidden_dim}")
+    logger.info(f"  edge_hidden_dim: {base_config.edge_hidden_dim}")
+    logger.info(f"  num_layers: {base_config.num_layers}")
+    logger.info(f"  k_neighbors: {base_config.k_neighbors}")
+    logger.info(f"  dropout: {base_config.dropout}")
+    logger.info(f"  use_global_pool: {base_config.use_global_pool}")
+    logger.info(f"  use_mutation_info: {base_config.use_mutation_info}")
+    logger.info(f"  batch_size: {base_config.batch_size}")
+    logger.info(f"  learning_rate: {base_config.learning_rate}")
+    logger.info(f"  weight_decay: {base_config.weight_decay}")
+    logger.info(f"  epochs: {base_config.epochs}")
+    logger.info(f"  patience: {base_config.patience}")
+    logger.info(f"  loss_fn: {base_config.loss_fn}")
+    logger.info(f"  device: {base_config.device}")
+    logger.info(f"  seed: {base_config.seed}")
+    logger.info(f"{'=' * 50}\n")
+
     # Save config once at run level
     base_config.save(run_dir / "config.json")
 
