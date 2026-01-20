@@ -309,23 +309,30 @@ def train_fold(
     test_dataset = MutationGraphDataset(test_megascale, graph_cache, config.k_neighbors)
 
     # DataLoaders (using PyG's DataLoader)
+    use_persistent = config.num_workers > 0
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
+        pin_memory=True,
+        persistent_workers=use_persistent,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
+        pin_memory=True,
+        persistent_workers=use_persistent,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
+        pin_memory=True,
+        persistent_workers=use_persistent,
     )
 
     # Model
@@ -473,6 +480,7 @@ def train_cv(
     logger.info(f"  loss_fn: {base_config.loss_fn}")
     logger.info(f"  device: {base_config.device}")
     logger.info(f"  seed: {base_config.seed}")
+    logger.info(f"  num_workers: {base_config.num_workers}")
     logger.info(f"{'=' * 50}\n")
 
     # Save config once at run level
@@ -573,6 +581,7 @@ def main():
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=8, help="Number of DataLoader workers")
 
     args = parser.parse_args()
 
@@ -594,6 +603,7 @@ def main():
         loss_fn=args.loss,
         device=args.device,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
 
     if args.fold is not None:
