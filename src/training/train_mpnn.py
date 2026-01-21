@@ -271,9 +271,17 @@ def train_epoch(
 def train_fold(
     config: MPNNTrainingConfig,
     verbose: bool = True,
+    checkpoint_dir: Path | None = None,
+    checkpoint_interval: int = 20,
 ) -> tuple[nn.Module, EvaluationResults, dict]:
     """
     Train on a single fold.
+
+    Args:
+        config: Training configuration
+        verbose: Whether to log progress
+        checkpoint_dir: Directory to save checkpoints (None = no checkpoints)
+        checkpoint_interval: Save checkpoint every N epochs
 
     Returns:
         Tuple of (trained model, test results, training history)
@@ -419,6 +427,20 @@ def train_fold(
                     logger.info(f"Early stopping at epoch {epoch + 1}")
                 break
 
+        # Periodic checkpoint saving
+        if checkpoint_dir is not None and (epoch + 1) % checkpoint_interval == 0:
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "val_spearman": val_results.mean_spearman,
+                "best_val_spearman": best_val_spearman,
+            }, checkpoint_path)
+            if verbose:
+                logger.info(f"Saved checkpoint: {checkpoint_path}")
+
     # Load best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
@@ -501,16 +523,19 @@ def train_cv(
 
         config = MPNNTrainingConfig(**{**asdict(base_config), "fold": fold})
 
-        model, test_results, history = train_fold(config, verbose=True)
+        # Create fold directory for checkpoints
+        fold_dir = run_dir / f"fold_{fold}"
+        fold_dir.mkdir(exist_ok=True)
+
+        model, test_results, history = train_fold(
+            config, verbose=True, checkpoint_dir=fold_dir, checkpoint_interval=20
+        )
 
         all_results.append(test_results)
         all_histories.append(history)
 
         # Save model and results per fold
         if save_models:
-            fold_dir = run_dir / f"fold_{fold}"
-            fold_dir.mkdir(exist_ok=True)
-
             torch.save(model.state_dict(), fold_dir / "model.pt")
 
             with open(fold_dir / "results.json", "w") as f:
