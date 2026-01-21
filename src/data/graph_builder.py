@@ -72,27 +72,20 @@ def build_mutation_graph(
     # Extract node features (single embeddings)
     x = single[node_indices]  # [K+1, D_single]
 
-    # Build fully connected edge index (excluding self-loops)
-    # For each pair (i, j) where i != j, we have an edge
-    src = []
-    dst = []
-    for i in range(num_nodes):
-        for j in range(num_nodes):
-            if i != j:
-                src.append(i)
-                dst.append(j)
+    # Build fully connected edge index (excluding self-loops) - fully vectorized
+    # Create all pairs (i, j) where i != j using meshgrid
+    arange = torch.arange(num_nodes, device=device)
+    grid_i, grid_j = torch.meshgrid(arange, arange, indexing='ij')
+    mask = grid_i != grid_j  # Exclude self-loops
+    src = grid_i[mask]  # [E]
+    dst = grid_j[mask]  # [E]
+    edge_index = torch.stack([src, dst])  # [2, E]
 
-    edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)  # [2, E]
-
-    # Extract edge features (pair embeddings)
-    # Map from local indices back to global indices
-    edge_attr_list = []
-    for s, d in zip(src, dst):
-        global_s = node_indices[s].item()
-        global_d = node_indices[d].item()
-        edge_attr_list.append(pair[global_s, global_d])
-
-    edge_attr = torch.stack(edge_attr_list)  # [E, D_pair]
+    # Extract edge features (pair embeddings) - vectorized
+    # Map from local indices to global indices
+    global_src = node_indices[src]  # [E]
+    global_dst = node_indices[dst]  # [E]
+    edge_attr = pair[global_src, global_dst]  # [E, D_pair]
 
     # Mutation info
     wt_idx = torch.tensor(wt_residue, dtype=torch.long, device=device)
