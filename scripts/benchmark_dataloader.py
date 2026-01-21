@@ -93,35 +93,32 @@ def benchmark_full_getitem(dataset: MutationGraphDataset, n_samples: int = 1000)
     return elapsed
 
 
-def benchmark_dataloader_only(dataset: MutationGraphDataset, batch_size: int = 1024, n_batches: int = 10, num_workers: int = 4):
-    """Benchmark DataLoader batching/collation + CPU->GPU transfer."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+def benchmark_dataloader_only(dataset: MutationGraphDataset, batch_size: int = 1024, n_batches: int = 10):
+    """Benchmark DataLoader batching/collation (data already on GPU)."""
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
     # Warmup
-    batch = next(iter(loader))
-    batch = batch.to(device)
+    _ = next(iter(loader))
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
     t0 = time.time()
     for i, batch in enumerate(loader):
         if i >= n_batches:
             break
-        batch = batch.to(device)  # Include GPU transfer in timing
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = time.time() - t0
-    print(f"DataLoader + GPU transfer: {elapsed:.2f}s for {n_batches} batches ({elapsed/n_batches:.2f}s/batch)")
+    print(f"DataLoader (data on GPU): {elapsed:.2f}s for {n_batches} batches ({elapsed/n_batches:.2f}s/batch)")
     return elapsed
 
 
-def benchmark_forward_pass(dataset: MutationGraphDataset, batch_size: int = 1024, n_batches: int = 10, num_workers: int = 4):
-    """Benchmark DataLoader + GPU transfer + model forward pass."""
+def benchmark_forward_pass(dataset: MutationGraphDataset, batch_size: int = 1024, n_batches: int = 10):
+    """Benchmark DataLoader + model forward pass (data already on GPU)."""
     from src.models.mpnn import ChaiMPNNWithMutationInfo
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = dataset.device
     model = ChaiMPNNWithMutationInfo(
         node_in_dim=384,
         edge_in_dim=256,
@@ -132,23 +129,21 @@ def benchmark_forward_pass(dataset: MutationGraphDataset, batch_size: int = 1024
     ).to(device)
     model.eval()
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
     # Warmup
     batch = next(iter(loader))
-    batch = batch.to(device)
     with torch.no_grad():
         _ = model(batch)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
     t0 = time.time()
     with torch.no_grad():
         for i, batch in enumerate(loader):
             if i >= n_batches:
                 break
-            batch = batch.to(device)
             _ = model(batch)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -167,8 +162,8 @@ def main():
     parser.add_argument("--n-samples", type=int, default=1000)
     parser.add_argument("--n-batches", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--num-workers", type=int, default=4, help="Number of DataLoader workers")
     parser.add_argument("--thermompnn-splits", type=str, default=None, help="Path to mega_splits.pkl for ThermoMPNN splits")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     # Load dataset (ThermoMPNN splits or HuggingFace)
@@ -198,18 +193,18 @@ def main():
     print("DATASET BENCHMARKS")
     print(f"{'='*60}\n")
 
-    # Create MutationGraphDataset on CPU (matches training config)
-    print("Creating MutationGraphDataset on CPU (batches transferred to GPU)...")
-    dataset = MutationGraphDataset(megascale, graph_cache, k_neighbors=30, device="cpu")
+    # Create MutationGraphDataset on GPU (matches training config)
+    print(f"Creating MutationGraphDataset on {args.device}...")
+    dataset = MutationGraphDataset(megascale, graph_cache, k_neighbors=30, device=args.device)
 
     t_getitem = benchmark_full_getitem(dataset, args.n_samples)
 
     print(f"\n{'='*60}")
-    print(f"DATALOADER BENCHMARKS (num_workers={args.num_workers}, pin_memory=True)")
+    print("DATALOADER BENCHMARKS (data on GPU, num_workers=0)")
     print(f"{'='*60}\n")
 
-    t_dataloader = benchmark_dataloader_only(dataset, args.batch_size, args.n_batches, args.num_workers)
-    t_forward = benchmark_forward_pass(dataset, args.batch_size, args.n_batches, args.num_workers)
+    t_dataloader = benchmark_dataloader_only(dataset, args.batch_size, args.n_batches)
+    t_forward = benchmark_forward_pass(dataset, args.batch_size, args.n_batches)
 
     print(f"\n{'='*60}")
     print("SUMMARY")
@@ -219,14 +214,14 @@ def main():
     print(f"  Embedding lookup:  {t_embedding/args.n_samples*1000:.2f}ms")
     print(f"  Graph build:       {t_graph/args.n_samples*1000:.2f}ms")
     print(f"  Full __getitem__:  {t_getitem/args.n_samples*1000:.2f}ms")
-    print(f"\nWith batch_size={args.batch_size}, num_workers={args.num_workers}:")
+    print(f"\nWith batch_size={args.batch_size}:")
     print(f"  Expected batch time from __getitem__: {t_getitem/args.n_samples*args.batch_size:.2f}s")
-    print(f"  Actual DataLoader + GPU transfer:     {t_dataloader/args.n_batches:.2f}s/batch")
+    print(f"  Actual DataLoader (on GPU):           {t_dataloader/args.n_batches:.2f}s/batch")
     print(f"  Actual DataLoader + Forward:          {t_forward/args.n_batches:.2f}s/batch")
     print(f"\nBottleneck analysis:")
     gpu_time = t_forward - t_dataloader
-    print(f"  DataLoader + transfer: {t_dataloader/args.n_batches:.2f}s/batch")
-    print(f"  GPU forward pass:      {gpu_time/args.n_batches:.2f}s/batch")
+    print(f"  DataLoader overhead: {t_dataloader/args.n_batches:.2f}s/batch")
+    print(f"  GPU forward pass:    {gpu_time/args.n_batches:.2f}s/batch")
 
 
 if __name__ == "__main__":
