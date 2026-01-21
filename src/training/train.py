@@ -26,7 +26,7 @@ from src.data.dataset import MegaScaleDataset, collate_mutations, parse_mutation
 from src.features.mutation_encoder import EmbeddingCache, encode_batch
 from src.models.pair_aware_mlp import PairAwareMLP
 from src.training.sampler import BalancedProteinSampler, FullDatasetSampler
-from src.training.evaluate import evaluate_model, EvaluationResults
+from src.training.evaluate import evaluate_model, evaluate_precomputed, EvaluationResults
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -176,6 +176,53 @@ class ThermoMPNNSplitDataset(Dataset):
         return dict(self._wt_cache)
 
 
+# =============================================================================
+# Precomputed Features Dataset
+# =============================================================================
+
+
+class PrecomputedDataset(Dataset):
+    """
+    Efficient dataset that loads pre-encoded tensors directly from RAM.
+
+    Use scripts/precompute.py to generate the .pt files.
+    """
+
+    def __init__(self, pt_file_path: str | Path):
+        self.path = Path(pt_file_path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Precomputed file not found: {self.path}")
+
+        logger.info(f"Loading precomputed data from {self.path}...")
+        data = torch.load(self.path, map_location="cpu", weights_only=False)
+        self.features = data["features"]
+        self.targets = data["targets"]
+        self.protein_names = data.get("protein_names", None)
+        self.length = self.targets.shape[0]
+        logger.info(f"  Loaded {self.length} samples")
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int):
+        # Fast: just tensor slicing
+        feats = {k: v[idx] for k, v in self.features.items()}
+        protein_name = self.protein_names[idx] if self.protein_names else None
+        return feats, self.targets[idx], protein_name
+
+
+def collate_precomputed(batch: list) -> tuple[dict, torch.Tensor, list]:
+    """Collate function for PrecomputedDataset."""
+    features_list, targets_list, protein_names = zip(*batch)
+
+    # Stack features
+    keys = features_list[0].keys()
+    batched_features = {k: torch.stack([f[k] for f in features_list]) for k in keys}
+    batched_targets = torch.stack(targets_list)
+
+    return batched_features, batched_targets, list(protein_names)
+
+
 @dataclass
 class TrainingConfig:
     """Training hyperparameters."""
@@ -189,6 +236,7 @@ class TrainingConfig:
     embedding_dir: str = "data/embeddings/chai_trunk"
     thermompnn_splits: Optional[str] = None  # Path to mega_splits.pkl for ThermoMPNN comparison
     thermompnn_cv_fold: Optional[int] = None  # If set, use ThermoMPNN's CV folds instead of main split
+    precomputed_dir: Optional[str] = None  # Path to precomputed features (for fast training)
 
     # Model
     d_single: int = 384
@@ -234,30 +282,46 @@ def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    embedding_cache: EmbeddingCache,
     config: TrainingConfig,
     device: torch.device,
+    embedding_cache: Optional[EmbeddingCache] = None,
+    precomputed: bool = False,
 ) -> float:
-    """Train for one epoch. Returns average loss."""
+    """Train for one epoch. Returns average loss.
+
+    Args:
+        model: The model to train
+        dataloader: DataLoader for training data
+        optimizer: Optimizer
+        config: Training configuration
+        device: Device to train on
+        embedding_cache: Required if precomputed=False
+        precomputed: If True, batch is (features_dict, targets) from PrecomputedDataset
+    """
     model.train()
     total_loss = 0.0
     n_batches = 0
 
     for batch in tqdm(dataloader, desc="Training", leave=False):
-        # Encode features
-        features = encode_batch(
-            cache=embedding_cache,
-            protein_names=batch["wt_names"],
-            positions=batch["positions"].tolist(),
-            wt_residues=batch["wt_residues"].tolist(),
-            mut_residues=batch["mut_residues"].tolist(),
-            k_structural=config.k_structural,
-            seq_window=config.seq_window,
-        )
+        if precomputed:
+            # Fast path: features already encoded
+            features, targets, _ = batch  # _ is protein_names, not needed for training
+        else:
+            # Slow path: encode on-the-fly
+            features = encode_batch(
+                cache=embedding_cache,
+                protein_names=batch["wt_names"],
+                positions=batch["positions"].tolist(),
+                wt_residues=batch["wt_residues"].tolist(),
+                mut_residues=batch["mut_residues"].tolist(),
+                k_structural=config.k_structural,
+                seq_window=config.seq_window,
+            )
+            targets = batch["ddg"]
 
-        # Move to device
-        features = {k: v.to(device) for k, v in features.items()}
-        targets = batch["ddg"].to(device)
+        # Move to device (non_blocking for better GPU utilization)
+        features = {k: v.to(device, non_blocking=True) for k, v in features.items()}
+        targets = targets.to(device, non_blocking=True)
 
         # Forward
         preds = model.forward_dict(features).squeeze(-1)
@@ -269,7 +333,7 @@ def train_epoch(
             loss = F.mse_loss(preds, targets)
 
         # Backward
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # Slightly faster
         loss.backward()
 
         if config.gradient_clip > 0:
@@ -298,76 +362,126 @@ def train_fold(
     # Set seed
     torch.manual_seed(config.seed)
 
-    # Load datasets
-    if config.thermompnn_splits:
-        # Use ThermoMPNN's official splits for fair comparison
-        if verbose:
-            logger.info(f"Using ThermoMPNN splits from {config.thermompnn_splits}")
-            if config.thermompnn_cv_fold is not None:
-                logger.info(f"Using ThermoMPNN CV fold {config.thermompnn_cv_fold}")
-            else:
-                logger.info("Using ThermoMPNN main train/val/test split")
+    # Check if precomputed features are available
+    use_precomputed = False
+    if config.precomputed_dir:
+        precomputed_path = Path(config.precomputed_dir)
+        train_pt = precomputed_path / "train_features.pt"
+        if train_pt.exists():
+            use_precomputed = True
+            if verbose:
+                logger.info(f"FAST MODE: Using precomputed features from {config.precomputed_dir}")
 
-        train_dataset = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="train", cv_fold=config.thermompnn_cv_fold
+    if use_precomputed:
+        # === FAST PATH: Precomputed features ===
+        train_dataset = PrecomputedDataset(precomputed_path / "train_features.pt")
+        val_dataset = PrecomputedDataset(precomputed_path / "val_features.pt")
+        test_dataset = PrecomputedDataset(precomputed_path / "test_features.pt")
+
+        if verbose:
+            logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+
+        # Fast dataloaders with pin_memory for GPU transfer
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            collate_fn=collate_precomputed,
+            num_workers=2,
+            pin_memory=True,
         )
-        val_dataset = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="val", cv_fold=config.thermompnn_cv_fold
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_precomputed,
+            num_workers=2,
+            pin_memory=True,
         )
-        test_dataset = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="test", cv_fold=config.thermompnn_cv_fold
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_precomputed,
+            num_workers=2,
+            pin_memory=True,
         )
+
+        embedding_cache = None  # Not needed for precomputed
+
     else:
-        # Use HuggingFace's CV splits (default)
+        # === SLOW PATH: On-the-fly encoding ===
         if verbose:
-            logger.info(f"Loading HuggingFace fold {config.fold}...")
+            logger.info("Using on-the-fly feature encoding (slow mode)")
 
-        train_dataset = MegaScaleDataset(fold=config.fold, split="train")
-        val_dataset = MegaScaleDataset(fold=config.fold, split="val")
-        test_dataset = MegaScaleDataset(fold=config.fold, split="test")
+        # Load datasets
+        if config.thermompnn_splits:
+            if verbose:
+                logger.info(f"Using ThermoMPNN splits from {config.thermompnn_splits}")
+                if config.thermompnn_cv_fold is not None:
+                    logger.info(f"Using ThermoMPNN CV fold {config.thermompnn_cv_fold}")
+                else:
+                    logger.info("Using ThermoMPNN main train/val/test split")
 
-    if verbose:
-        logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+            train_dataset = ThermoMPNNSplitDataset(
+                config.thermompnn_splits, split="train", cv_fold=config.thermompnn_cv_fold
+            )
+            val_dataset = ThermoMPNNSplitDataset(
+                config.thermompnn_splits, split="val", cv_fold=config.thermompnn_cv_fold
+            )
+            test_dataset = ThermoMPNNSplitDataset(
+                config.thermompnn_splits, split="test", cv_fold=config.thermompnn_cv_fold
+            )
+        else:
+            if verbose:
+                logger.info(f"Loading HuggingFace fold {config.fold}...")
 
-    # Dataloaders
-    train_sampler = BalancedProteinSampler(
-        train_dataset,
-        variants_per_protein=config.variants_per_protein,
-        shuffle=True,
-        seed=config.seed,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        sampler=train_sampler,
-        collate_fn=collate_mutations,
-        num_workers=0,
-    )
+            train_dataset = MegaScaleDataset(fold=config.fold, split="train")
+            val_dataset = MegaScaleDataset(fold=config.fold, split="val")
+            test_dataset = MegaScaleDataset(fold=config.fold, split="test")
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        sampler=FullDatasetSampler(val_dataset, shuffle=False),
-        collate_fn=collate_mutations,
-        num_workers=0,
-    )
+        if verbose:
+            logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.batch_size,
-        sampler=FullDatasetSampler(test_dataset, shuffle=False),
-        collate_fn=collate_mutations,
-        num_workers=0,
-    )
+        # Slow dataloaders
+        train_sampler = BalancedProteinSampler(
+            train_dataset,
+            variants_per_protein=config.variants_per_protein,
+            shuffle=True,
+            seed=config.seed,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            sampler=train_sampler,
+            collate_fn=collate_mutations,
+            num_workers=0,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            sampler=FullDatasetSampler(val_dataset, shuffle=False),
+            collate_fn=collate_mutations,
+            num_workers=0,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.batch_size,
+            sampler=FullDatasetSampler(test_dataset, shuffle=False),
+            collate_fn=collate_mutations,
+            num_workers=0,
+        )
 
-    # Load embeddings
-    embedding_cache = EmbeddingCache(config.embedding_dir)
-
-    # Preload embeddings for all proteins in this fold
-    all_proteins = set(train_dataset.unique_proteins) | set(val_dataset.unique_proteins) | set(test_dataset.unique_proteins)
-    if verbose:
-        logger.info(f"Preloading embeddings for {len(all_proteins)} proteins...")
-    embedding_cache.preload(list(all_proteins))
+        # Load embeddings
+        embedding_cache = EmbeddingCache(config.embedding_dir)
+        all_proteins = (
+            set(train_dataset.unique_proteins)
+            | set(val_dataset.unique_proteins)
+            | set(test_dataset.unique_proteins)
+        )
+        if verbose:
+            logger.info(f"Preloading embeddings for {len(all_proteins)} proteins...")
+        embedding_cache.preload(list(all_proteins))
 
     # Model
     model = PairAwareMLP(
@@ -405,14 +519,23 @@ def train_fold(
     for epoch in range(config.epochs):
         # Train
         train_loss = train_epoch(
-            model, train_loader, optimizer, embedding_cache, config, device
+            model,
+            train_loader,
+            optimizer,
+            config,
+            device,
+            embedding_cache=embedding_cache,
+            precomputed=use_precomputed,
         )
         history["train_loss"].append(train_loss)
 
         # Validate
-        val_results = evaluate_model(
-            model, val_loader, embedding_cache, encode_batch, device
-        )
+        if use_precomputed:
+            val_results = evaluate_precomputed(model, val_loader, device)
+        else:
+            val_results = evaluate_model(
+                model, val_loader, embedding_cache, encode_batch, device
+            )
         history["val_spearman"].append(val_results.mean_spearman)
         history["val_rmse"].append(val_results.rmse)
 
@@ -444,9 +567,12 @@ def train_fold(
         model.to(device)
 
     # Final test evaluation
-    test_results = evaluate_model(
-        model, test_loader, embedding_cache, encode_batch, device
-    )
+    if use_precomputed:
+        test_results = evaluate_precomputed(model, test_loader, device)
+    else:
+        test_results = evaluate_model(
+            model, test_loader, embedding_cache, encode_batch, device
+        )
 
     if verbose:
         logger.info(f"\nTest Results (Fold {config.fold}):")
@@ -571,6 +697,8 @@ def main():
                        help="Path to mega_splits.pkl for ThermoMPNN comparison (uses their train/val/test split)")
     parser.add_argument("--thermompnn-cv-fold", type=int, default=None,
                        help="If set, use ThermoMPNN's CV fold (0-4) instead of main split")
+    parser.add_argument("--precomputed-dir", type=str, default=None,
+                       help="Path to precomputed features (use scripts/precompute.py to generate)")
 
     args = parser.parse_args()
 
@@ -581,6 +709,7 @@ def main():
         output_dir=args.output_dir,
         thermompnn_splits=args.thermompnn_splits,
         thermompnn_cv_fold=args.thermompnn_cv_fold,
+        precomputed_dir=args.precomputed_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,

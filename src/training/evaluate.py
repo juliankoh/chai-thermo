@@ -202,6 +202,45 @@ def evaluate_model(
     return compute_metrics(predictions, targets, min_mutations=min_mutations)
 
 
+def evaluate_precomputed(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    min_mutations: int = 10,
+) -> EvaluationResults:
+    """
+    Evaluate model on precomputed features.
+
+    Args:
+        model: The model to evaluate
+        dataloader: DataLoader yielding (features, targets, protein_names) batches
+        device: Device to run on
+        min_mutations: Min mutations per protein for per-protein metrics
+
+    Returns:
+        EvaluationResults
+    """
+    model.eval()
+
+    predictions: dict[str, list[float]] = defaultdict(list)
+    targets: dict[str, list[float]] = defaultdict(list)
+
+    with torch.no_grad():
+        for features, batch_targets, protein_names in dataloader:
+            # Move to device
+            features = {k: v.to(device) for k, v in features.items()}
+
+            # Forward pass
+            preds = model.forward_dict(features).squeeze(-1)
+
+            # Collect per-protein results
+            for i, protein in enumerate(protein_names):
+                predictions[protein].append(preds[i].cpu().item())
+                targets[protein].append(batch_targets[i].item())
+
+    return compute_metrics(predictions, targets, min_mutations=min_mutations)
+
+
 def analyze_by_mutation_type(
     predictions: dict[str, list[float]],
     targets: dict[str, list[float]],
