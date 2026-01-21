@@ -150,7 +150,12 @@ class EvaluationResults:
         )
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Convert numpy types to Python types for JSON serialization
+        for k, v in d.items():
+            if hasattr(v, 'item'):
+                d[k] = v.item()
+        return d
 
 
 def evaluate_mpnn(
