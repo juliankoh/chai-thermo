@@ -36,6 +36,26 @@ logger = logging.getLogger(__name__)
 # ThermoMPNN Splits Dataset
 # =============================================================================
 
+# Global cache for HuggingFace dataset to avoid reloading
+_HF_DATASET_CACHE = None
+
+
+def _get_hf_dataset():
+    """Get cached HuggingFace dataset, loading once if needed."""
+    global _HF_DATASET_CACHE
+    if _HF_DATASET_CACHE is None:
+        logger.info("Loading MegaScale dataset from HuggingFace (one-time)...")
+        _HF_DATASET_CACHE = load_dataset("RosettaCommons/MegaScale", "dataset3_single_cv")
+        logger.info(f"Dataset loaded. Splits: {list(_HF_DATASET_CACHE.keys())}")
+    return _HF_DATASET_CACHE
+
+
+def load_thermompnn_splits(splits_file: str | Path) -> dict:
+    """Load and cache the ThermoMPNN splits file."""
+    with open(splits_file, 'rb') as f:
+        return pickle.load(f)
+
+
 class ThermoMPNNSplitDataset(Dataset):
     """
     MegaScale dataset using ThermoMPNN's official train/val/test splits.
@@ -51,6 +71,7 @@ class ThermoMPNNSplitDataset(Dataset):
         splits_file: str | Path,
         split: str = "train",
         cv_fold: Optional[int] = None,
+        _preloaded_splits: Optional[dict] = None,
     ):
         """
         Load MegaScale filtered to ThermoMPNN's splits.
@@ -60,14 +81,16 @@ class ThermoMPNNSplitDataset(Dataset):
             split: One of 'train', 'val', 'test'
             cv_fold: If provided, use cv_train_{fold}, cv_val_{fold}, cv_test_{fold}
                     If None, use the main train/val/test split
+            _preloaded_splits: Pre-loaded splits dict (for efficiency)
         """
         self.splits_file = Path(splits_file)
         self.split = split
 
-        # Load splits
-        logger.info(f"Loading ThermoMPNN splits from {splits_file}...")
-        with open(splits_file, 'rb') as f:
-            splits = pickle.load(f)
+        # Load splits (use preloaded if available)
+        if _preloaded_splits is not None:
+            splits = _preloaded_splits
+        else:
+            splits = load_thermompnn_splits(splits_file)
 
         # Determine which key to use
         if cv_fold is not None:
@@ -89,9 +112,8 @@ class ThermoMPNNSplitDataset(Dataset):
 
         logger.info(f"Split '{split_key}': {len(target_proteins)} proteins")
 
-        # Load full dataset from HuggingFace
-        logger.info("Loading MegaScale dataset from HuggingFace...")
-        ds = load_dataset("RosettaCommons/MegaScale", "dataset3_single_cv")
+        # Get cached HuggingFace dataset
+        ds = _get_hf_dataset()
 
         # Collect all mutations for target proteins (deduplicated)
         all_rows = []

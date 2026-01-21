@@ -128,7 +128,7 @@ class EmbeddingCache:
         Get (single, pair) embeddings for a protein.
 
         Returns:
-            Tuple of (single [L, D_single], pair [L, L, D_pair])
+            Tuple of (single [L, D_single], pair [L, L, D_pair]) as float32
         """
         if protein_name not in self._cache:
             path = self.embedding_dir / f"{protein_name}.pt"
@@ -136,7 +136,10 @@ class EmbeddingCache:
                 raise FileNotFoundError(f"No embedding file for {protein_name} at {path}")
 
             data = torch.load(path, map_location="cpu", weights_only=False)
-            self._cache[protein_name] = (data["single"], data["pair"])
+            # Convert to float32 (embeddings may be stored as float16)
+            single = data["single"].float()
+            pair = data["pair"].float()
+            self._cache[protein_name] = (single, pair)
 
         return self._cache[protein_name]
 
