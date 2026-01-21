@@ -85,8 +85,7 @@ class MutationGraphDataset(Dataset):
     """
     Dataset that returns PyG Data objects for each mutation.
 
-    Precomputes neighbor indices (expensive topk) and reuses edge_index template.
-    Only tensor indexing happens in __getitem__.
+    Keeps embeddings on GPU for fast indexing.
     """
 
     def __init__(
@@ -94,39 +93,51 @@ class MutationGraphDataset(Dataset):
         megascale_dataset: MegaScaleDataset,
         graph_cache: GraphEmbeddingCache,
         k_neighbors: int = 30,
+        device: str = "cuda",
     ):
-        self.graph_cache = graph_cache
         self.k_neighbors = k_neighbors
+        self.device = torch.device(device)
 
-        # Edge index is identical for all graphs - compute once
+        # Move all embeddings to GPU
+        logger.info(f"Moving embeddings to {device}...")
+        self.embeddings = {
+            name: (single.to(self.device), pair.to(self.device))
+            for name, (single, pair) in graph_cache._cache.items()
+        }
+
+        # Edge index template on GPU (same for all graphs)
         num_nodes = k_neighbors + 1
-        arange = torch.arange(num_nodes)
+        arange = torch.arange(num_nodes, device=self.device)
         grid_i, grid_j = torch.meshgrid(arange, arange, indexing='ij')
         mask = grid_i != grid_j
         self.edge_index_template = torch.stack([grid_i[mask], grid_j[mask]])
 
-        # Precompute neighbor indices (the expensive topk)
+        # Precompute neighbor indices on GPU
         logger.info(f"Precomputing graphs for {len(megascale_dataset)} samples...")
         self.samples = []
         for i in tqdm(range(len(megascale_dataset)), desc="Precomputing"):
             sample = megascale_dataset[i]
-            single, pair = graph_cache.get(sample.wt_name)
+            single, pair = self.embeddings[sample.wt_name]
+            L = single.shape[0]
 
-            # topk - do this once
+            # topk on GPU
             pair_row = pair[sample.position]
             magnitudes = pair_row.norm(dim=-1)
             magnitudes[sample.position] = float("-inf")
-            k_actual = min(k_neighbors, single.shape[0] - 1)
+            k_actual = min(k_neighbors, L - 1)
             neighbor_indices = magnitudes.topk(k=k_actual).indices
 
-            node_indices = torch.cat([torch.tensor([sample.position]), neighbor_indices])
+            node_indices = torch.cat([
+                torch.tensor([sample.position], device=self.device),
+                neighbor_indices,
+            ])
 
             self.samples.append({
                 'protein': sample.wt_name,
                 'node_indices': node_indices,
                 'wt_idx': megascale_dataset.encode_residue(sample.wt_residue),
                 'mut_idx': megascale_dataset.encode_residue(sample.mut_residue),
-                'rel_pos': sample.position / single.shape[0],
+                'rel_pos': sample.position / L,
                 'ddg': sample.ddg,
             })
 
@@ -135,10 +146,10 @@ class MutationGraphDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Data:
         s = self.samples[idx]
-        single, pair = self.graph_cache.get(s['protein'])
+        single, pair = self.embeddings[s['protein']]
         node_idx = s['node_indices']
 
-        # Just tensor indexing - no topk, no meshgrid
+        # Fast GPU indexing
         x = single[node_idx]
         edge_attr = pair[node_idx[self.edge_index_template[0]],
                         node_idx[self.edge_index_template[1]]]
@@ -147,10 +158,10 @@ class MutationGraphDataset(Dataset):
             x=x,
             edge_index=self.edge_index_template.clone(),
             edge_attr=edge_attr,
-            wt_idx=torch.tensor(s['wt_idx']),
-            mut_idx=torch.tensor(s['mut_idx']),
-            rel_pos=torch.tensor(s['rel_pos'], dtype=torch.float32),
-            y=torch.tensor([s['ddg']], dtype=torch.float32),
+            wt_idx=torch.tensor(s['wt_idx'], device=self.device),
+            mut_idx=torch.tensor(s['mut_idx'], device=self.device),
+            rel_pos=torch.tensor(s['rel_pos'], device=self.device),
+            y=torch.tensor([s['ddg']], device=self.device),
         )
 
 
@@ -349,9 +360,9 @@ def train_fold(
     graph_cache.preload(list(all_proteins))
 
     # Create graph datasets
-    train_dataset = MutationGraphDataset(train_megascale, graph_cache, config.k_neighbors)
-    val_dataset = MutationGraphDataset(val_megascale, graph_cache, config.k_neighbors)
-    test_dataset = MutationGraphDataset(test_megascale, graph_cache, config.k_neighbors)
+    train_dataset = MutationGraphDataset(train_megascale, graph_cache, config.k_neighbors, device=config.device)
+    val_dataset = MutationGraphDataset(val_megascale, graph_cache, config.k_neighbors, device=config.device)
+    test_dataset = MutationGraphDataset(test_megascale, graph_cache, config.k_neighbors, device=config.device)
 
     # DataLoaders (using PyG's DataLoader)
     train_loader = DataLoader(

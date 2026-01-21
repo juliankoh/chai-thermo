@@ -94,28 +94,31 @@ def benchmark_full_getitem(dataset: MutationGraphDataset, n_samples: int = 1000)
 
 
 def benchmark_dataloader_only(dataset: MutationGraphDataset, batch_size: int = 1024, n_batches: int = 10):
-    """Benchmark DataLoader batching/collation only, no GPU."""
+    """Benchmark DataLoader batching/collation (data already on GPU)."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     # Warmup
     _ = next(iter(loader))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     t0 = time.time()
     for i, batch in enumerate(loader):
         if i >= n_batches:
             break
-        # Don't move to GPU - just measure collation
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     elapsed = time.time() - t0
-    print(f"DataLoader only (no GPU): {elapsed:.2f}s for {n_batches} batches ({elapsed/n_batches:.2f}s/batch)")
+    print(f"DataLoader only (collation): {elapsed:.2f}s for {n_batches} batches ({elapsed/n_batches:.2f}s/batch)")
     return elapsed
 
 
 def benchmark_forward_pass(dataset: MutationGraphDataset, batch_size: int = 1024, n_batches: int = 10):
-    """Benchmark DataLoader + model forward pass."""
+    """Benchmark DataLoader + model forward pass (data already on GPU)."""
     from src.models.mpnn import ChaiMPNNWithMutationInfo
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = dataset.device
     model = ChaiMPNNWithMutationInfo(
         node_in_dim=384,
         edge_in_dim=256,
@@ -129,7 +132,7 @@ def benchmark_forward_pass(dataset: MutationGraphDataset, batch_size: int = 1024
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     # Warmup
-    batch = next(iter(loader)).to(device)
+    batch = next(iter(loader))
     with torch.no_grad():
         _ = model(batch)
     if torch.cuda.is_available():
@@ -141,7 +144,6 @@ def benchmark_forward_pass(dataset: MutationGraphDataset, batch_size: int = 1024
         for i, batch in enumerate(loader):
             if i >= n_batches:
                 break
-            batch = batch.to(device)
             _ = model(batch)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -160,6 +162,7 @@ def main():
     parser.add_argument("--n-samples", type=int, default=1000)
     parser.add_argument("--n-batches", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     print(f"Loading MegaScaleDataset (fold={args.fold}, split={args.split})...")
@@ -184,9 +187,9 @@ def main():
     print("DATASET BENCHMARKS")
     print(f"{'='*60}\n")
 
-    # Create MutationGraphDataset (this will cache samples)
-    print("Creating MutationGraphDataset...")
-    dataset = MutationGraphDataset(megascale, graph_cache, k_neighbors=30)
+    # Create MutationGraphDataset (this will cache samples and move to GPU)
+    print(f"Creating MutationGraphDataset on {args.device}...")
+    dataset = MutationGraphDataset(megascale, graph_cache, k_neighbors=30, device=args.device)
 
     t_getitem = benchmark_full_getitem(dataset, args.n_samples)
 
