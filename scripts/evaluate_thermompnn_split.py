@@ -77,11 +77,12 @@ class FilteredMegaScaleDataset(Dataset):
                         all_rows.append(row)
 
         self.data = all_rows
-        print(f"Found {len(self.data)} mutations across {len(self.unique_proteins)} proteins in test set")
 
         # Build WT sequence cache
         self._wt_cache: dict[str, str] = {}
         self._build_wt_cache()
+
+        print(f"Found {len(self.data)} mutations across {len(self.unique_proteins)} proteins in test set")
 
     def _build_wt_cache(self) -> None:
         """Build cache of WT sequences for each protein."""
