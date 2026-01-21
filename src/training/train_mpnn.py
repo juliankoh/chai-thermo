@@ -85,8 +85,8 @@ class MutationGraphDataset(Dataset):
     """
     Dataset that returns PyG Data objects for each mutation.
 
-    Caches lightweight MutationSample objects upfront to avoid HuggingFace access overhead.
-    Builds graphs on-the-fly using cached embeddings.
+    Precomputes neighbor indices (expensive topk) and reuses edge_index template.
+    Only tensor indexing happens in __getitem__.
     """
 
     def __init__(
@@ -98,31 +98,60 @@ class MutationGraphDataset(Dataset):
         self.graph_cache = graph_cache
         self.k_neighbors = k_neighbors
 
-        # Cache lightweight samples upfront (~50MB total)
-        logger.info(f"Caching {len(megascale_dataset)} samples...")
+        # Edge index is identical for all graphs - compute once
+        num_nodes = k_neighbors + 1
+        arange = torch.arange(num_nodes)
+        grid_i, grid_j = torch.meshgrid(arange, arange, indexing='ij')
+        mask = grid_i != grid_j
+        self.edge_index_template = torch.stack([grid_i[mask], grid_j[mask]])
+
+        # Precompute neighbor indices (the expensive topk)
+        logger.info(f"Precomputing graphs for {len(megascale_dataset)} samples...")
         self.samples = []
-        for i in tqdm(range(len(megascale_dataset)), desc="Caching samples"):
+        for i in tqdm(range(len(megascale_dataset)), desc="Precomputing"):
             sample = megascale_dataset[i]
-            wt_idx = megascale_dataset.encode_residue(sample.wt_residue)
-            mut_idx = megascale_dataset.encode_residue(sample.mut_residue)
-            self.samples.append((sample.wt_name, sample.position, wt_idx, mut_idx, sample.ddg))
+            single, pair = graph_cache.get(sample.wt_name)
+
+            # topk - do this once
+            pair_row = pair[sample.position]
+            magnitudes = pair_row.norm(dim=-1)
+            magnitudes[sample.position] = float("-inf")
+            k_actual = min(k_neighbors, single.shape[0] - 1)
+            neighbor_indices = magnitudes.topk(k=k_actual).indices
+
+            node_indices = torch.cat([torch.tensor([sample.position]), neighbor_indices])
+
+            self.samples.append({
+                'protein': sample.wt_name,
+                'node_indices': node_indices,
+                'wt_idx': megascale_dataset.encode_residue(sample.wt_residue),
+                'mut_idx': megascale_dataset.encode_residue(sample.mut_residue),
+                'rel_pos': sample.position / single.shape[0],
+                'ddg': sample.ddg,
+            })
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Data:
-        wt_name, position, wt_idx, mut_idx, ddg = self.samples[idx]
+        s = self.samples[idx]
+        single, pair = self.graph_cache.get(s['protein'])
+        node_idx = s['node_indices']
 
-        graph = self.graph_cache.build_graph(
-            protein_name=wt_name,
-            position=position,
-            wt_residue=wt_idx,
-            mut_residue=mut_idx,
-            k_neighbors=self.k_neighbors,
-            ddg=ddg,
+        # Just tensor indexing - no topk, no meshgrid
+        x = single[node_idx]
+        edge_attr = pair[node_idx[self.edge_index_template[0]],
+                        node_idx[self.edge_index_template[1]]]
+
+        return Data(
+            x=x,
+            edge_index=self.edge_index_template.clone(),
+            edge_attr=edge_attr,
+            wt_idx=torch.tensor(s['wt_idx']),
+            mut_idx=torch.tensor(s['mut_idx']),
+            rel_pos=torch.tensor(s['rel_pos'], dtype=torch.float32),
+            y=torch.tensor([s['ddg']], dtype=torch.float32),
         )
-
-        return graph
 
 
 @dataclass
