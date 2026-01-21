@@ -83,7 +83,6 @@ def evaluate_fold(
     device: torch.device,
     split: str = "test",
     batch_size: int = 128,
-    num_workers: int = 4,
 ) -> tuple[EvaluationResults, dict]:
     """
     Evaluate model on a fold.
@@ -95,7 +94,6 @@ def evaluate_fold(
         device: Device to run on
         split: Which split to evaluate ('test', 'val', 'train')
         batch_size: Batch size for evaluation
-        num_workers: Number of data loading workers
 
     Returns:
         (EvaluationResults, per_protein_dict)
@@ -111,13 +109,11 @@ def evaluate_fold(
     # Create graph dataset
     graph_dataset = MutationGraphDataset(megascale, graph_cache, config.k_neighbors)
 
-    # DataLoader with parallel workers
+    # DataLoader
     loader = DataLoader(
         graph_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
     )
 
     # Single pass evaluation - collect predictions and compute metrics
@@ -212,7 +208,6 @@ def main():
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--per-protein", action="store_true", help="Show per-protein breakdown")
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, help="Save results to JSON")
 
@@ -258,7 +253,6 @@ def main():
         results, per_protein = evaluate_fold(
             model, fold, config, device,
             split=args.split, batch_size=args.batch_size,
-            num_workers=args.num_workers,
         )
         all_results.append(results)
 
