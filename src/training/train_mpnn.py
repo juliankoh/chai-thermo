@@ -85,7 +85,7 @@ class MutationGraphDataset(Dataset):
     """
     Dataset that returns PyG Data objects for each mutation.
 
-    Wraps MegaScaleDataset and builds graphs on-the-fly using cached embeddings.
+    Pre-builds all graphs upfront to avoid CPU bottleneck during training.
     """
 
     def __init__(
@@ -94,31 +94,30 @@ class MutationGraphDataset(Dataset):
         graph_cache: GraphEmbeddingCache,
         k_neighbors: int = 30,
     ):
-        self.megascale = megascale_dataset
-        self.graph_cache = graph_cache
         self.k_neighbors = k_neighbors
 
+        # Pre-build all graphs upfront
+        logger.info(f"Pre-building {len(megascale_dataset)} graphs...")
+        self.graphs = []
+        for idx in tqdm(range(len(megascale_dataset)), desc="Building graphs"):
+            sample = megascale_dataset[idx]
+            wt_idx = megascale_dataset.encode_residue(sample.wt_residue)
+            mut_idx = megascale_dataset.encode_residue(sample.mut_residue)
+            graph = graph_cache.build_graph(
+                protein_name=sample.wt_name,
+                position=sample.position,
+                wt_residue=wt_idx,
+                mut_residue=mut_idx,
+                k_neighbors=k_neighbors,
+                ddg=sample.ddg,
+            )
+            self.graphs.append(graph)
+
     def __len__(self) -> int:
-        return len(self.megascale)
+        return len(self.graphs)
 
     def __getitem__(self, idx: int) -> Data:
-        sample = self.megascale[idx]
-
-        # Get amino acid indices
-        wt_idx = self.megascale.encode_residue(sample.wt_residue)
-        mut_idx = self.megascale.encode_residue(sample.mut_residue)
-
-        # Build graph
-        graph = self.graph_cache.build_graph(
-            protein_name=sample.wt_name,
-            position=sample.position,
-            wt_residue=wt_idx,
-            mut_residue=mut_idx,
-            k_neighbors=self.k_neighbors,
-            ddg=sample.ddg,
-        )
-
-        return graph
+        return self.graphs[idx]
 
 
 @dataclass
@@ -389,32 +388,39 @@ def train_fold(
         train_loss = train_epoch(model, train_loader, optimizer, config, device)
         history["train_loss"].append(float(train_loss))
 
-        # Validate
-        val_results = evaluate_mpnn(model, val_loader, device, val_megascale)
-        history["val_spearman"].append(float(val_results.mean_spearman))
-        history["val_rmse"].append(float(val_results.rmse))
-
         scheduler.step()
 
-        if verbose:
-            logger.info(
-                f"Epoch {epoch + 1}/{config.epochs} | "
-                f"Loss: {train_loss:.4f} | "
-                f"Val Spearman: {val_results.mean_spearman:.4f} | "
-                f"Val RMSE: {val_results.rmse:.4f}"
-            )
+        # Validate every 5 epochs (or first epoch) to reduce overhead
+        eval_interval = 5
+        should_eval = (epoch + 1) % eval_interval == 0 or epoch == 0
 
-        # Early stopping
-        if val_results.mean_spearman > best_val_spearman:
-            best_val_spearman = val_results.mean_spearman
-            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
+        if should_eval:
+            val_results = evaluate_mpnn(model, val_loader, device, val_megascale)
+            history["val_spearman"].append(float(val_results.mean_spearman))
+            history["val_rmse"].append(float(val_results.rmse))
+
+            if verbose:
+                logger.info(
+                    f"Epoch {epoch + 1}/{config.epochs} | "
+                    f"Loss: {train_loss:.4f} | "
+                    f"Val Spearman: {val_results.mean_spearman:.4f} | "
+                    f"Val RMSE: {val_results.rmse:.4f}"
+                )
+
+            # Early stopping (only check when we validate)
+            if val_results.mean_spearman > best_val_spearman:
+                best_val_spearman = val_results.mean_spearman
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= config.patience:
+                    if verbose:
+                        logger.info(f"Early stopping at epoch {epoch + 1}")
+                    break
         else:
-            patience_counter += 1
-            if patience_counter >= config.patience:
-                if verbose:
-                    logger.info(f"Early stopping at epoch {epoch + 1}")
-                break
+            if verbose:
+                logger.info(f"Epoch {epoch + 1}/{config.epochs} | Loss: {train_loss:.4f}")
 
         # Periodic checkpoint saving
         if checkpoint_dir is not None and (epoch + 1) % checkpoint_interval == 0:
@@ -424,7 +430,6 @@ def train_fold(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "val_spearman": val_results.mean_spearman,
                 "best_val_spearman": best_val_spearman,
             }, checkpoint_path)
             if verbose:
