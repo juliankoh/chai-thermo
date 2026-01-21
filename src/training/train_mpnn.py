@@ -202,7 +202,7 @@ class MutationGraphDataset(Dataset):
     """
     Dataset that returns PyG Data objects for each mutation.
 
-    Keeps embeddings on GPU for fast indexing.
+    Keeps embeddings on CPU to prevent OOM on large datasets.
     """
 
     def __init__(
@@ -210,38 +210,44 @@ class MutationGraphDataset(Dataset):
         megascale_dataset: MegaScaleDataset,
         graph_cache: GraphEmbeddingCache,
         k_neighbors: int = 30,
-        device: str = "cuda",
+        device: str = "cpu",  # Default to CPU for storage
     ):
         self.k_neighbors = k_neighbors
-        self.device = torch.device(device)
+        # Keep dataset on CPU, only moving batches to GPU later
+        self.device = torch.device("cpu")
 
-        # Move all embeddings to GPU
-        logger.info(f"Moving embeddings to {device}...")
-        self.embeddings = {
-            name: (single.to(self.device), pair.to(self.device))
-            for name, (single, pair) in graph_cache._cache.items()
-        }
+        # KEEP EMBEDDINGS ON CPU
+        logger.info("Indexing embeddings (keeping on CPU)...")
+        self.embeddings = graph_cache._cache
 
-        # Edge index template on GPU (same for all graphs)
+        # Edge index template (k_neighbors x k_neighbors fully connected)
         num_nodes = k_neighbors + 1
         arange = torch.arange(num_nodes, device=self.device)
         grid_i, grid_j = torch.meshgrid(arange, arange, indexing='ij')
         mask = grid_i != grid_j
         self.edge_index_template = torch.stack([grid_i[mask], grid_j[mask]])
 
-        # Precompute neighbor indices on GPU
+        # Precompute neighbor indices
         logger.info(f"Precomputing graphs for {len(megascale_dataset)} samples...")
         self.samples = []
+
         for i in tqdm(range(len(megascale_dataset)), desc="Precomputing"):
             sample = megascale_dataset[i]
+
+            # Ensure we are working with CPU tensors here
             single, pair = self.embeddings[sample.wt_name]
+            single = single.cpu()
+            pair = pair.cpu()
+
             L = single.shape[0]
 
-            # topk on GPU
+            # Calculate neighbors (CPU is fine here to save VRAM)
             pair_row = pair[sample.position]
             magnitudes = pair_row.norm(dim=-1)
-            magnitudes[sample.position] = float("-inf")
+            magnitudes[sample.position] = float("-inf")  # Mask self
             k_actual = min(k_neighbors, L - 1)
+
+            # topk on CPU
             neighbor_indices = magnitudes.topk(k=k_actual).indices
 
             node_indices = torch.cat([
@@ -266,19 +272,24 @@ class MutationGraphDataset(Dataset):
         single, pair = self.embeddings[s['protein']]
         node_idx = s['node_indices']
 
-        # Fast GPU indexing
+        # Slicing happens on CPU
         x = single[node_idx]
-        edge_attr = pair[node_idx[self.edge_index_template[0]],
-                        node_idx[self.edge_index_template[1]]]
 
+        # Advanced indexing for edge features
+        row_idx = node_idx[self.edge_index_template[0]]
+        col_idx = node_idx[self.edge_index_template[1]]
+        edge_attr = pair[row_idx, col_idx]
+
+        # Return Data object on CPU
+        # The DataLoader will pin memory and transfer to GPU
         return Data(
             x=x,
             edge_index=self.edge_index_template.clone(),
             edge_attr=edge_attr,
-            wt_idx=torch.tensor(s['wt_idx'], device=self.device),
-            mut_idx=torch.tensor(s['mut_idx'], device=self.device),
-            rel_pos=torch.tensor(s['rel_pos'], device=self.device),
-            y=torch.tensor([s['ddg']], device=self.device),
+            wt_idx=torch.tensor(s['wt_idx']),
+            mut_idx=torch.tensor(s['mut_idx']),
+            rel_pos=torch.tensor(s['rel_pos']),
+            y=torch.tensor([s['ddg']]),
         )
 
 
@@ -496,26 +507,33 @@ def train_fold(
         logger.info(f"Preloading embeddings for {len(all_proteins)} proteins...")
     graph_cache.preload(list(all_proteins))
 
-    # Create graph datasets
-    train_dataset = MutationGraphDataset(train_megascale, graph_cache, config.k_neighbors, device=config.device)
-    val_dataset = MutationGraphDataset(val_megascale, graph_cache, config.k_neighbors, device=config.device)
-    test_dataset = MutationGraphDataset(test_megascale, graph_cache, config.k_neighbors, device=config.device)
+    # Create graph datasets (keep on CPU, transfer batches to GPU)
+    train_dataset = MutationGraphDataset(train_megascale, graph_cache, config.k_neighbors, device="cpu")
+    val_dataset = MutationGraphDataset(val_megascale, graph_cache, config.k_neighbors, device="cpu")
+    test_dataset = MutationGraphDataset(test_megascale, graph_cache, config.k_neighbors, device="cpu")
 
-    # DataLoaders (using PyG's DataLoader)
+    # DataLoaders with workers and pin_memory for efficient GPU transfer
+    num_workers = 4  # Adjust based on CPU cores
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.batch_size,
         shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
 
     # Model
