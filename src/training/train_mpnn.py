@@ -390,12 +390,12 @@ def train_fold(
     for epoch in range(config.epochs):
         # Train
         train_loss = train_epoch(model, train_loader, optimizer, config, device)
-        history["train_loss"].append(train_loss)
+        history["train_loss"].append(float(train_loss))
 
         # Validate
         val_results = evaluate_mpnn(model, val_loader, device, val_megascale)
-        history["val_spearman"].append(val_results.mean_spearman)
-        history["val_rmse"].append(val_results.rmse)
+        history["val_spearman"].append(float(val_results.mean_spearman))
+        history["val_rmse"].append(float(val_results.rmse))
 
         scheduler.step()
 
