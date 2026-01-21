@@ -833,7 +833,29 @@ def main():
     if config.thermompnn_splits:
         # ThermoMPNN splits: train a single model (not CV)
         logger.info("Training with ThermoMPNN splits (single model, no CV)")
-        train_fold(config, verbose=True)
+
+        # Create run directory
+        run_dir = generate_run_dir(config.output_dir, config)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Run directory: {run_dir}")
+
+        # Save config
+        config.save(run_dir / "config.json")
+
+        model, test_results, history = train_fold(
+            config, verbose=True, checkpoint_dir=run_dir, checkpoint_interval=20
+        )
+
+        # Save final model and results
+        torch.save(model.state_dict(), run_dir / "model.pt")
+
+        with open(run_dir / "results.json", "w") as f:
+            json.dump(test_results.to_dict(), f, indent=2)
+
+        with open(run_dir / "history.json", "w") as f:
+            json.dump(history, f, indent=2)
+
+        logger.info(f"\nResults saved to: {run_dir}")
     elif args.fold is not None:
         config.fold = args.fold
         train_fold(config, verbose=True)
