@@ -85,7 +85,8 @@ class MutationGraphDataset(Dataset):
     """
     Dataset that returns PyG Data objects for each mutation.
 
-    Pre-builds all graphs upfront to avoid CPU bottleneck during training.
+    Caches lightweight MutationSample objects upfront to avoid HuggingFace access overhead.
+    Builds graphs on-the-fly using cached embeddings.
     """
 
     def __init__(
@@ -94,30 +95,34 @@ class MutationGraphDataset(Dataset):
         graph_cache: GraphEmbeddingCache,
         k_neighbors: int = 30,
     ):
+        self.graph_cache = graph_cache
         self.k_neighbors = k_neighbors
 
-        # Pre-build all graphs upfront
-        logger.info(f"Pre-building {len(megascale_dataset)} graphs...")
-        self.graphs = []
-        for idx in tqdm(range(len(megascale_dataset)), desc="Building graphs"):
-            sample = megascale_dataset[idx]
+        # Cache lightweight samples upfront (~50MB total)
+        logger.info(f"Caching {len(megascale_dataset)} samples...")
+        self.samples = []
+        for i in tqdm(range(len(megascale_dataset)), desc="Caching samples"):
+            sample = megascale_dataset[i]
             wt_idx = megascale_dataset.encode_residue(sample.wt_residue)
             mut_idx = megascale_dataset.encode_residue(sample.mut_residue)
-            graph = graph_cache.build_graph(
-                protein_name=sample.wt_name,
-                position=sample.position,
-                wt_residue=wt_idx,
-                mut_residue=mut_idx,
-                k_neighbors=k_neighbors,
-                ddg=sample.ddg,
-            )
-            self.graphs.append(graph)
+            self.samples.append((sample.wt_name, sample.position, wt_idx, mut_idx, sample.ddg))
 
     def __len__(self) -> int:
-        return len(self.graphs)
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> Data:
-        return self.graphs[idx]
+        wt_name, position, wt_idx, mut_idx, ddg = self.samples[idx]
+
+        graph = self.graph_cache.build_graph(
+            protein_name=wt_name,
+            position=position,
+            wt_residue=wt_idx,
+            mut_residue=mut_idx,
+            k_neighbors=self.k_neighbors,
+            ddg=ddg,
+        )
+
+        return graph
 
 
 @dataclass
