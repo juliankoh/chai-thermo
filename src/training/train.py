@@ -1,11 +1,13 @@
 """Training loop for protein stability prediction.
 
 Supports single-fold training and full cross-validation.
+Optionally uses ThermoMPNN splits for fair comparison.
 """
 
 import argparse
 import json
 import logging
+import pickle
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
@@ -16,10 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
+from datasets import load_dataset
 from tqdm import tqdm
 
-from src.data.dataset import MegaScaleDataset, collate_mutations
+from src.data.dataset import MegaScaleDataset, collate_mutations, parse_mutation, get_wt_sequence, MutationSample
 from src.features.mutation_encoder import EmbeddingCache, encode_batch
 from src.models.pair_aware_mlp import PairAwareMLP
 from src.training.sampler import BalancedProteinSampler, FullDatasetSampler
@@ -27,6 +30,128 @@ from src.training.evaluate import evaluate_model, EvaluationResults
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# ThermoMPNN Splits Dataset
+# =============================================================================
+
+class ThermoMPNNSplitDataset(Dataset):
+    """
+    MegaScale dataset using ThermoMPNN's official train/val/test splits.
+
+    This enables fair comparison with ThermoMPNN's reported results.
+    """
+
+    AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY"
+    AA_TO_IDX = {aa: i for i, aa in enumerate(AA_VOCAB)}
+
+    def __init__(
+        self,
+        splits_file: str | Path,
+        split: str = "train",
+        cv_fold: Optional[int] = None,
+    ):
+        """
+        Load MegaScale filtered to ThermoMPNN's splits.
+
+        Args:
+            splits_file: Path to mega_splits.pkl from ThermoMPNN
+            split: One of 'train', 'val', 'test'
+            cv_fold: If provided, use cv_train_{fold}, cv_val_{fold}, cv_test_{fold}
+                    If None, use the main train/val/test split
+        """
+        self.splits_file = Path(splits_file)
+        self.split = split
+
+        # Load splits
+        logger.info(f"Loading ThermoMPNN splits from {splits_file}...")
+        with open(splits_file, 'rb') as f:
+            splits = pickle.load(f)
+
+        # Determine which key to use
+        if cv_fold is not None:
+            split_key = f"cv_{split}_{cv_fold}"
+        else:
+            split_key = split
+
+        if split_key not in splits:
+            available = [k for k in splits.keys() if not k.startswith('cv_') or cv_fold is not None]
+            raise ValueError(f"Split '{split_key}' not found. Available: {available}")
+
+        # Get protein names for this split (normalize by removing .pdb)
+        target_proteins = set()
+        for p in splits[split_key]:
+            # Handle both numpy arrays and lists
+            if hasattr(p, 'item'):
+                p = p.item()
+            target_proteins.add(p.replace('.pdb', ''))
+
+        logger.info(f"Split '{split_key}': {len(target_proteins)} proteins")
+
+        # Load full dataset from HuggingFace
+        logger.info("Loading MegaScale dataset from HuggingFace...")
+        ds = load_dataset("RosettaCommons/MegaScale", "dataset3_single_cv")
+
+        # Collect all mutations for target proteins (deduplicated)
+        all_rows = []
+        seen = set()
+
+        for hf_split in ds.keys():
+            for row in ds[hf_split]:
+                key = (row['WT_name'], row['mut_type'])
+                if key not in seen:
+                    seen.add(key)
+                    wt_name = row['WT_name'].replace('.pdb', '')
+                    if wt_name in target_proteins:
+                        all_rows.append(row)
+
+        self.data = all_rows
+        logger.info(f"Found {len(self.data)} mutations for {split_key}")
+
+        # Build WT sequence cache
+        self._wt_cache: dict[str, str] = {}
+        self._build_wt_cache()
+
+    def _build_wt_cache(self) -> None:
+        """Build cache of WT sequences for each protein."""
+        for row in self.data:
+            wt_name = row["WT_name"]
+            if wt_name not in self._wt_cache:
+                mut_seq = row["aa_seq"]
+                mut_type = row["mut_type"]
+                self._wt_cache[wt_name] = get_wt_sequence(mut_seq, mut_type)
+
+    def get_wt_sequence(self, wt_name: str) -> str:
+        return self._wt_cache[wt_name]
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> MutationSample:
+        row = self.data[idx]
+        wt_aa, pos_1idx, mut_aa = parse_mutation(row["mut_type"])
+
+        # Flip sign: MegaScale uses inverted convention
+        ddg_standard = -row["ddG_ML"]
+
+        return MutationSample(
+            wt_name=row["WT_name"],
+            wt_sequence=self.get_wt_sequence(row["WT_name"]),
+            mut_sequence=row["aa_seq"],
+            position=pos_1idx - 1,
+            wt_residue=wt_aa,
+            mut_residue=mut_aa,
+            ddg=ddg_standard,
+        )
+
+    @property
+    def unique_proteins(self) -> list[str]:
+        return list(self._wt_cache.keys())
+
+    @property
+    def wt_sequences(self) -> dict[str, str]:
+        return dict(self._wt_cache)
 
 
 @dataclass
@@ -40,6 +165,8 @@ class TrainingConfig:
     # Data
     fold: int = 0
     embedding_dir: str = "data/embeddings/chai_trunk"
+    thermompnn_splits: Optional[str] = None  # Path to mega_splits.pkl for ThermoMPNN comparison
+    thermompnn_cv_fold: Optional[int] = None  # If set, use ThermoMPNN's CV folds instead of main split
 
     # Model
     d_single: int = 384
@@ -150,12 +277,32 @@ def train_fold(
     torch.manual_seed(config.seed)
 
     # Load datasets
-    if verbose:
-        logger.info(f"Loading fold {config.fold}...")
+    if config.thermompnn_splits:
+        # Use ThermoMPNN's official splits for fair comparison
+        if verbose:
+            logger.info(f"Using ThermoMPNN splits from {config.thermompnn_splits}")
+            if config.thermompnn_cv_fold is not None:
+                logger.info(f"Using ThermoMPNN CV fold {config.thermompnn_cv_fold}")
+            else:
+                logger.info("Using ThermoMPNN main train/val/test split")
 
-    train_dataset = MegaScaleDataset(fold=config.fold, split="train")
-    val_dataset = MegaScaleDataset(fold=config.fold, split="val")
-    test_dataset = MegaScaleDataset(fold=config.fold, split="test")
+        train_dataset = ThermoMPNNSplitDataset(
+            config.thermompnn_splits, split="train", cv_fold=config.thermompnn_cv_fold
+        )
+        val_dataset = ThermoMPNNSplitDataset(
+            config.thermompnn_splits, split="val", cv_fold=config.thermompnn_cv_fold
+        )
+        test_dataset = ThermoMPNNSplitDataset(
+            config.thermompnn_splits, split="test", cv_fold=config.thermompnn_cv_fold
+        )
+    else:
+        # Use HuggingFace's CV splits (default)
+        if verbose:
+            logger.info(f"Loading HuggingFace fold {config.fold}...")
+
+        train_dataset = MegaScaleDataset(fold=config.fold, split="train")
+        val_dataset = MegaScaleDataset(fold=config.fold, split="val")
+        test_dataset = MegaScaleDataset(fold=config.fold, split="test")
 
     if verbose:
         logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -398,6 +545,10 @@ def main():
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "huber"])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--thermompnn-splits", type=str, default=None,
+                       help="Path to mega_splits.pkl for ThermoMPNN comparison (uses their train/val/test split)")
+    parser.add_argument("--thermompnn-cv-fold", type=int, default=None,
+                       help="If set, use ThermoMPNN's CV fold (0-4) instead of main split")
 
     args = parser.parse_args()
 
@@ -406,6 +557,8 @@ def main():
         model_type=args.model_type,
         embedding_dir=args.embedding_dir,
         output_dir=args.output_dir,
+        thermompnn_splits=args.thermompnn_splits,
+        thermompnn_cv_fold=args.thermompnn_cv_fold,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
@@ -417,7 +570,25 @@ def main():
         seed=args.seed,
     )
 
-    if args.fold is not None:
+    if args.thermompnn_splits:
+        # When using ThermoMPNN splits, train a single model (no CV by default)
+        logger.info("Training with ThermoMPNN splits (single train/val/test)")
+        model, test_results, history = train_fold(config, verbose=True)
+
+        # Save model
+        run_dir = generate_run_dir(config.output_dir, config)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        config.save(run_dir / "config.json")
+
+        torch.save(model.state_dict(), run_dir / "model.pt")
+        with open(run_dir / "results.json", "w") as f:
+            json.dump(test_results.to_dict(), f, indent=2)
+        with open(run_dir / "history.json", "w") as f:
+            json.dump(history, f, indent=2)
+
+        logger.info(f"\nResults saved to: {run_dir}")
+
+    elif args.fold is not None:
         config.fold = args.fold
         train_fold(config, verbose=True)
     else:

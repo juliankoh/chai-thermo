@@ -55,17 +55,22 @@ class FilteredMegaScaleDataset(Dataset):
         self.target_proteins = {
             p.replace('.pdb', '') for p in protein_names
         }
+        print(f"Looking for {len(self.target_proteins)} target proteins (normalized names)")
+        print(f"Target proteins: {sorted(self.target_proteins)[:10]}{'...' if len(self.target_proteins) > 10 else ''}")
 
         # Load full dataset from HuggingFace (all folds combined have same data, just split differently)
         # We load all splits and dedupe to get the full dataset
-        print("Loading MegaScale dataset from HuggingFace...")
+        print("\nLoading MegaScale dataset from HuggingFace...")
         ds = load_dataset("RosettaCommons/MegaScale", "dataset3_single_cv")
+        print(f"Dataset loaded. Available splits: {list(ds.keys())}")
 
         # Combine all splits to access full data
         all_rows = []
         seen = set()
+        proteins_found = set()
 
         for split_name in ds.keys():
+            split_count = 0
             for row in ds[split_name]:
                 # Create unique key for deduplication
                 key = (row['WT_name'], row['mut_type'])
@@ -75,14 +80,25 @@ class FilteredMegaScaleDataset(Dataset):
                     wt_name = row['WT_name'].replace('.pdb', '')
                     if wt_name in self.target_proteins:
                         all_rows.append(row)
+                        proteins_found.add(wt_name)
+                        split_count += 1
+            print(f"  Split '{split_name}': found {split_count} new matching mutations")
 
         self.data = all_rows
+
+        # Report which proteins were/weren't found
+        proteins_missing = self.target_proteins - proteins_found
+        if proteins_missing:
+            print(f"\nWARNING: {len(proteins_missing)} proteins not found in dataset:")
+            print(f"  {sorted(proteins_missing)}")
+
+        print(f"\nProteins found: {len(proteins_found)}/{len(self.target_proteins)}")
 
         # Build WT sequence cache
         self._wt_cache: dict[str, str] = {}
         self._build_wt_cache()
 
-        print(f"Found {len(self.data)} mutations across {len(self.unique_proteins)} proteins in test set")
+        print(f"Total: {len(self.data)} mutations across {len(self.unique_proteins)} proteins")
 
     def _build_wt_cache(self) -> None:
         """Build cache of WT sequences for each protein."""
@@ -451,11 +467,22 @@ def main():
 
     args = parser.parse_args()
 
+    print("="*60)
+    print("ThermoMPNN Test Split Evaluation")
+    print("="*60)
+    print(f"Model path: {args.model_path}")
+    print(f"Splits file: {args.splits_file}")
+    print(f"Embedding dir: {args.embedding_dir}")
+    print(f"Device: {args.device}")
+    print(f"Batch size: {args.batch_size}")
+    print("="*60)
+
     device = torch.device(args.device)
 
     # Load ThermoMPNN splits
-    print(f"Loading splits from {args.splits_file}...")
+    print(f"\n[1/5] Loading splits from {args.splits_file}...")
     splits = load_thermompnn_splits(Path(args.splits_file))
+    print(f"Available keys in splits file: {list(splits.keys())}")
 
     # Get test proteins
     test_proteins = set(splits['test'])
@@ -463,6 +490,7 @@ def main():
     print(f"Example proteins: {list(test_proteins)[:5]}")
 
     # Create filtered dataset
+    print(f"\n[2/5] Creating filtered dataset...")
     dataset = FilteredMegaScaleDataset(test_proteins)
 
     if len(dataset) == 0:
@@ -470,13 +498,18 @@ def main():
         return
 
     # Load config
+    print(f"\n[3/5] Loading model configuration...")
     model_dir = Path(args.model_path).parent
     config_path = model_dir.parent / "config.json"
 
     config = {}
     if config_path.exists():
+        print(f"Config found at: {config_path}")
         with open(config_path) as f:
             config = json.load(f)
+        print(f"Config keys: {list(config.keys())}")
+    else:
+        print(f"WARNING: No config.json found at {config_path}, using defaults")
 
     # Determine model type
     model_type = args.model_type
@@ -487,21 +520,28 @@ def main():
             model_type = "mpnn"
         else:
             model_type = "mlp"
-        print(f"Auto-detected model type: {model_type}")
+        print(f"Auto-detected model type: {model_type} (from config: '{config_model_type}')")
+    else:
+        print(f"Using specified model type: {model_type}")
 
-    print(f"Loading model from {args.model_path}...")
+    print(f"\n[4/5] Loading model from {args.model_path}...")
 
     if model_type == "mlp":
         # MLP evaluation
         from src.features.mutation_encoder import EmbeddingCache, encode_batch
 
         model = load_mlp_model(Path(args.model_path), config, device)
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"MLP model loaded. Parameters: {n_params:,}")
 
-        print(f"Loading embeddings from {args.embedding_dir}...")
+        print(f"\nLoading embeddings from {args.embedding_dir}...")
         embedding_cache = EmbeddingCache(args.embedding_dir)
+        print(f"Preloading embeddings for {len(dataset.unique_proteins)} proteins...")
         embedding_cache.preload(dataset.unique_proteins)
+        print("Embeddings loaded.")
 
-        print("\nEvaluating MLP on ThermoMPNN test split...")
+        print(f"\n[5/5] Evaluating MLP on ThermoMPNN test split...")
+        print(f"Total samples: {len(dataset)}")
         results = evaluate_mlp(
             model=model,
             dataset=dataset,
@@ -516,18 +556,24 @@ def main():
         from src.data.graph_builder import GraphEmbeddingCache
 
         model = load_mpnn_model(Path(args.model_path), config, device)
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"MPNN model loaded. Parameters: {n_params:,}")
 
-        print(f"Loading embeddings from {args.embedding_dir}...")
+        print(f"\nLoading embeddings from {args.embedding_dir}...")
         graph_cache = GraphEmbeddingCache(args.embedding_dir)
+        print(f"Preloading embeddings for {len(dataset.unique_proteins)} proteins...")
         graph_cache.preload(dataset.unique_proteins)
+        print("Embeddings loaded.")
 
         # Create MPNN dataset
         k_neighbors = config.get("k_neighbors", 30)
+        print(f"\nBuilding MPNN graph dataset (k_neighbors={k_neighbors})...")
         mpnn_dataset = FilteredMPNNDataset(
             dataset, graph_cache, k_neighbors=k_neighbors, device=args.device
         )
 
-        print("\nEvaluating MPNN on ThermoMPNN test split...")
+        print(f"\n[5/5] Evaluating MPNN on ThermoMPNN test split...")
+        print(f"Total samples: {len(mpnn_dataset)}")
         results = evaluate_mpnn(
             model=model,
             dataset=mpnn_dataset,
