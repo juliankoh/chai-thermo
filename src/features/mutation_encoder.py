@@ -210,4 +210,5 @@ def encode_batch(
         batch_features["pair_structural"].append(features.pair_structural)
         batch_features["mutation_feat"].append(features.mutation_feat)
 
-    return {k: torch.stack(v, dim=0) for k, v in batch_features.items()}
+    # Stack and ensure float32 dtype
+    return {k: torch.stack(v, dim=0).float() for k, v in batch_features.items()}
