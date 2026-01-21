@@ -83,6 +83,7 @@ def evaluate_fold(
     device: torch.device,
     split: str = "test",
     batch_size: int = 128,
+    num_workers: int = 4,
 ) -> tuple[EvaluationResults, dict]:
     """
     Evaluate model on a fold.
@@ -94,6 +95,7 @@ def evaluate_fold(
         device: Device to run on
         split: Which split to evaluate ('test', 'val', 'train')
         batch_size: Batch size for evaluation
+        num_workers: Number of data loading workers
 
     Returns:
         (EvaluationResults, per_protein_dict)
@@ -103,29 +105,28 @@ def evaluate_fold(
 
     # Load embeddings
     graph_cache = GraphEmbeddingCache(config.embedding_dir)
+    print(f"Preloading embeddings for {len(megascale.unique_proteins)} proteins...")
     graph_cache.preload(megascale.unique_proteins)
 
     # Create graph dataset
     graph_dataset = MutationGraphDataset(megascale, graph_cache, config.k_neighbors)
 
-    # DataLoader
+    # DataLoader with parallel workers
     loader = DataLoader(
         graph_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=True,
     )
 
-    # Use shared evaluation function
-    results = evaluate_mpnn(model, loader, device, megascale)
-
-    # Collect per-protein predictions for detailed analysis
+    # Single pass evaluation - collect predictions and compute metrics
     model.eval()
     all_preds = []
     all_targets = []
 
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, desc=f"Evaluating {split}"):
             batch = batch.to(device)
             preds = model(batch).squeeze(-1)
             all_preds.extend(preds.cpu().numpy())
@@ -133,13 +134,47 @@ def evaluate_fold(
 
     preds = np.array(all_preds)
     targets = np.array(all_targets)
-    protein_names = [megascale[i].wt_name for i in range(len(megascale))]
 
-    # Group by protein
+    # Get protein names directly from underlying data (faster than iterating __getitem__)
+    protein_names = [megascale.data[i]["WT_name"] for i in range(len(megascale))]
+
+    # Compute per-protein correlations
+    unique_proteins = list(set(protein_names))
+    spearmans = []
+    pearsons = []
     per_protein = defaultdict(lambda: {"preds": [], "targets": []})
+
     for i, prot in enumerate(protein_names):
         per_protein[prot]["preds"].append(preds[i])
         per_protein[prot]["targets"].append(targets[i])
+
+    for prot in unique_proteins:
+        p_preds = np.array(per_protein[prot]["preds"])
+        p_targets = np.array(per_protein[prot]["targets"])
+        if len(p_preds) >= 3 and np.std(p_preds) > 1e-6 and np.std(p_targets) > 1e-6:
+            spearmans.append(spearmanr(p_preds, p_targets)[0])
+            pearsons.append(pearsonr(p_preds, p_targets)[0])
+
+    # Global metrics
+    global_spearman = spearmanr(preds, targets)[0]
+    global_pearson = pearsonr(preds, targets)[0]
+    rmse = np.sqrt(np.mean((preds - targets) ** 2))
+    mae = np.mean(np.abs(preds - targets))
+
+    results = EvaluationResults(
+        mean_spearman=np.mean(spearmans) if spearmans else 0.0,
+        std_spearman=np.std(spearmans) if spearmans else 0.0,
+        median_spearman=np.median(spearmans) if spearmans else 0.0,
+        mean_pearson=np.mean(pearsons) if pearsons else 0.0,
+        std_pearson=np.std(pearsons) if pearsons else 0.0,
+        median_pearson=np.median(pearsons) if pearsons else 0.0,
+        global_spearman=global_spearman,
+        global_pearson=global_pearson,
+        rmse=rmse,
+        mae=mae,
+        n_proteins=len(unique_proteins),
+        n_mutations=len(preds),
+    )
 
     return results, dict(per_protein)
 
@@ -176,7 +211,8 @@ def main():
     parser.add_argument("--all-folds", action="store_true", help="Evaluate all available folds")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--per-protein", action="store_true", help="Show per-protein breakdown")
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, help="Save results to JSON")
 
@@ -221,7 +257,8 @@ def main():
         model = load_model(model_path, config, device)
         results, per_protein = evaluate_fold(
             model, fold, config, device,
-            split=args.split, batch_size=args.batch_size
+            split=args.split, batch_size=args.batch_size,
+            num_workers=args.num_workers,
         )
         all_results.append(results)
 

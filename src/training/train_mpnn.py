@@ -186,8 +186,8 @@ def evaluate_mpnn(
     preds = np.array(all_preds)
     targets = np.array(all_targets)
 
-    # Get protein names for each sample
-    protein_names = [megascale_dataset[i].wt_name for i in range(len(megascale_dataset))]
+    # Get protein names directly from underlying data (faster)
+    protein_names = [megascale_dataset.data[i]["WT_name"] for i in range(len(megascale_dataset))]
 
     # Per-protein correlations
     unique_proteins = list(set(protein_names))
