@@ -16,10 +16,15 @@ Usage:
     python scripts/evaluate_thermompnn_split.py --model-path outputs/<run>/fold_0/model.pt --splits-file mega_splits.pkl
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import argparse
 import pickle
 import json
-from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
