@@ -194,6 +194,7 @@ def main():
         config.thermompnn_splits,
         split=args.split,
         cv_fold=config.thermompnn_cv_fold,
+        data_path=getattr(config, 'data_path', None),
     )
 
     # Load embeddings

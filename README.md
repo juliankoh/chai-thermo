@@ -29,6 +29,15 @@ This significantly exceeds initial targets (0.55 Spearman) and validates the hyp
 uv sync  # or pip install -r requirements.txt
 ```
 
+### Download Data
+
+```bash
+# Download MegaScale dataset from HuggingFace (one-time, ~50MB)
+uv run python scripts/download_megascale.py
+```
+
+This creates `data/megascale.parquet` which is used by training/eval scripts.
+
 ### Training
 
 **MLP Model (original):**
@@ -190,9 +199,11 @@ chai-thermo/
 │       ├── sampler.py          # BalancedProteinSampler
 │       └── evaluate.py         # Metrics computation
 ├── scripts/
+│   ├── download_megascale.py   # Download dataset from HuggingFace
 │   ├── verify_alignment.py     # Pre-training sanity checks
 │   └── evaluate.py             # Evaluation + ablations
 ├── data/
+│   ├── megascale.parquet       # Local copy of MegaScale dataset
 │   └── embeddings/
 │       └── chai_trunk/         # Cached embeddings ({protein}.pt)
 └── outputs/

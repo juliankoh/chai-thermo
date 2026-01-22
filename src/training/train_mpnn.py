@@ -21,8 +21,9 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
-from datasets import load_dataset
 from tqdm import tqdm
+
+import pandas as pd
 
 from src.data.dataset import MegaScaleDataset, parse_mutation, get_wt_sequence, MutationSample
 from src.data.graph_builder import GraphEmbeddingCache
@@ -36,17 +37,30 @@ logger = logging.getLogger(__name__)
 # ThermoMPNN Splits Support (shared with train.py)
 # =============================================================================
 
-_HF_DATASET_CACHE = None
+DEFAULT_MEGASCALE_PATH = "data/megascale.parquet"
+_MEGASCALE_CACHE = None
 
 
-def _get_hf_dataset():
-    """Get cached HuggingFace dataset, loading once if needed."""
-    global _HF_DATASET_CACHE
-    if _HF_DATASET_CACHE is None:
-        logger.info("Loading MegaScale dataset from HuggingFace (one-time)...")
-        _HF_DATASET_CACHE = load_dataset("RosettaCommons/MegaScale", "dataset3_single_cv")
-        logger.info(f"Dataset loaded. Splits: {list(_HF_DATASET_CACHE.keys())}")
-    return _HF_DATASET_CACHE
+def _get_megascale_data(data_path: str | Path | None = None) -> pd.DataFrame:
+    """Load MegaScale data from local parquet file (cached)."""
+    global _MEGASCALE_CACHE
+
+    if _MEGASCALE_CACHE is not None:
+        return _MEGASCALE_CACHE
+
+    path = Path(data_path) if data_path else Path(DEFAULT_MEGASCALE_PATH)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"MegaScale data not found at {path}. "
+            f"Run 'uv run python scripts/download_megascale.py' first."
+        )
+
+    logger.info(f"Loading MegaScale data from {path}...")
+    _MEGASCALE_CACHE = pd.read_parquet(path)
+    logger.info(f"Loaded {len(_MEGASCALE_CACHE)} mutations from {_MEGASCALE_CACHE['WT_name'].nunique()} proteins")
+
+    return _MEGASCALE_CACHE
 
 
 class ThermoMPNNSplitDataset(Dataset):
@@ -60,6 +74,7 @@ class ThermoMPNNSplitDataset(Dataset):
         splits_file: str | Path,
         split: str = "train",
         cv_fold: Optional[int] = None,
+        data_path: str | Path | None = None,
     ):
         self.splits_file = Path(splits_file)
         self.split = split
@@ -86,23 +101,14 @@ class ThermoMPNNSplitDataset(Dataset):
 
         logger.info(f"Split '{split_key}': {len(target_proteins)} proteins")
 
-        # Get cached HuggingFace dataset
-        ds = _get_hf_dataset()
+        # Load from local parquet file
+        df = _get_megascale_data(data_path)
 
-        # Collect all mutations for target proteins
-        all_rows = []
-        seen = set()
+        # Filter to target proteins
+        df_filtered = df[df['WT_name'].str.replace('.pdb', '', regex=False).isin(target_proteins)]
 
-        for hf_split in ds.keys():
-            for row in ds[hf_split]:
-                key = (row['WT_name'], row['mut_type'])
-                if key not in seen:
-                    seen.add(key)
-                    wt_name = row['WT_name'].replace('.pdb', '')
-                    if wt_name in target_proteins:
-                        all_rows.append(row)
-
-        self.data = all_rows
+        # Convert to list of dicts for compatibility
+        self.data = df_filtered.to_dict('records')
         logger.info(f"Found {len(self.data)} mutations for {split_key}")
 
         # Build WT sequence cache
@@ -155,6 +161,7 @@ class MPNNTrainingConfig:
     # Data
     fold: int = 0
     embedding_dir: str = "data/embeddings/chai_trunk"
+    data_path: str = "data/megascale.parquet"  # Path to local MegaScale data
     thermompnn_splits: Optional[str] = None  # Path to mega_splits.pkl
     thermompnn_cv_fold: Optional[int] = None  # Use ThermoMPNN's CV fold instead of main split
 
@@ -500,13 +507,16 @@ def train_fold(
                 logger.info("Using ThermoMPNN main train/val/test split")
 
         train_megascale = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="train", cv_fold=config.thermompnn_cv_fold
+            config.thermompnn_splits, split="train", cv_fold=config.thermompnn_cv_fold,
+            data_path=config.data_path,
         )
         val_megascale = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="val", cv_fold=config.thermompnn_cv_fold
+            config.thermompnn_splits, split="val", cv_fold=config.thermompnn_cv_fold,
+            data_path=config.data_path,
         )
         test_megascale = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="test", cv_fold=config.thermompnn_cv_fold
+            config.thermompnn_splits, split="test", cv_fold=config.thermompnn_cv_fold,
+            data_path=config.data_path,
         )
     else:
         # Use HuggingFace's CV splits (default)
@@ -808,6 +818,8 @@ def main():
     )
     parser.add_argument("--run-name", type=str, default=None, help="Name for this training run")
     parser.add_argument("--embedding-dir", type=str, default="data/embeddings/chai_trunk")
+    parser.add_argument("--data-path", type=str, default="data/megascale.parquet",
+                        help="Path to local MegaScale parquet file")
     parser.add_argument("--output-dir", type=str, default="outputs")
 
     # Model architecture
@@ -864,6 +876,7 @@ def main():
     config = MPNNTrainingConfig(
         run_name=args.run_name,
         embedding_dir=args.embedding_dir,
+        data_path=args.data_path,
         output_dir=args.output_dir,
         hidden_dim=args.hidden_dim,
         edge_hidden_dim=args.edge_hidden_dim,
