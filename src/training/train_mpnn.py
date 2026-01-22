@@ -207,6 +207,14 @@ class MPNNTrainingConfig:
             return cls(**json.load(f))
 
 
+def build_edge_index(num_nodes: int, device: torch.device) -> torch.Tensor:
+    """Build fully connected edge index for a graph with num_nodes nodes."""
+    arange = torch.arange(num_nodes, device=device)
+    grid_i, grid_j = torch.meshgrid(arange, arange, indexing='ij')
+    mask = grid_i != grid_j
+    return torch.stack([grid_i[mask], grid_j[mask]])
+
+
 class MutationGraphDataset(Dataset):
     """
     Dataset that returns PyG Data objects for each mutation.
@@ -231,12 +239,8 @@ class MutationGraphDataset(Dataset):
             for name, (single, pair) in graph_cache._cache.items()
         }
 
-        # Edge index template on GPU
-        num_nodes = k_neighbors + 1
-        arange = torch.arange(num_nodes, device=self.device)
-        grid_i, grid_j = torch.meshgrid(arange, arange, indexing='ij')
-        mask = grid_i != grid_j
-        self.edge_index_template = torch.stack([grid_i[mask], grid_j[mask]])
+        # Cache edge index templates for different graph sizes
+        self._edge_index_cache: dict[int, torch.Tensor] = {}
 
         # Precompute neighbor indices on GPU
         logger.info(f"Precomputing graphs for {len(megascale_dataset)} samples...")
@@ -258,14 +262,24 @@ class MutationGraphDataset(Dataset):
                 neighbor_indices,
             ])
 
+            # Store actual number of nodes (no padding)
+            num_nodes = len(node_indices)
+
             self.samples.append({
                 'protein': sample.wt_name,
                 'node_indices': node_indices,
+                'num_nodes': num_nodes,
                 'wt_idx': megascale_dataset.encode_residue(sample.wt_residue),
                 'mut_idx': megascale_dataset.encode_residue(sample.mut_residue),
                 'rel_pos': sample.position / L,
                 'ddg': sample.ddg,
             })
+
+    def _get_edge_index(self, num_nodes: int) -> torch.Tensor:
+        """Get or create edge index for a graph with num_nodes nodes."""
+        if num_nodes not in self._edge_index_cache:
+            self._edge_index_cache[num_nodes] = build_edge_index(num_nodes, self.device)
+        return self._edge_index_cache[num_nodes]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -274,14 +288,17 @@ class MutationGraphDataset(Dataset):
         s = self.samples[idx]
         single, pair = self.embeddings[s['protein']]
         node_idx = s['node_indices']
+        num_nodes = s['num_nodes']
+
+        # Get edge index for this graph size
+        edge_index = self._get_edge_index(num_nodes)
 
         x = single[node_idx]
-        edge_attr = pair[node_idx[self.edge_index_template[0]],
-                        node_idx[self.edge_index_template[1]]]
+        edge_attr = pair[node_idx[edge_index[0]], node_idx[edge_index[1]]]
 
         return Data(
             x=x,
-            edge_index=self.edge_index_template.clone(),
+            edge_index=edge_index.clone(),
             edge_attr=edge_attr,
             wt_idx=torch.tensor(s['wt_idx'], device=self.device),
             mut_idx=torch.tensor(s['mut_idx'], device=self.device),
