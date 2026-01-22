@@ -31,27 +31,56 @@ uv sync  # or pip install -r requirements.txt
 
 ### Training
 
+**MLP Model (original):**
 ```bash
 # Train on a single fold
 uv run python -m src.training.train --fold 0 --embedding-dir data/embeddings/chai_trunk
 
 # Train all 5 folds (full cross-validation)
 uv run python -m src.training.train --embedding-dir data/embeddings/chai_trunk
+```
 
-# With custom hyperparameters
-uv run python -m src.training.train --fold 0 --lr 1e-4 --hidden-dim 768 --dropout 0.15
+**MPNN Model:**
+```bash
+# Train with ThermoMPNN's official splits
+uv run python -m src.training.train_mpnn \
+    --run-name mpnn_thermompnn_splits \
+    --thermompnn-splits mega_splits.pkl \
+    --batch-size 1024 \
+    --epochs 50
+
+# With antisymmetric loss (recommended for better generalization)
+uv run python -m src.training.train_mpnn \
+    --run-name mpnn_antisym \
+    --thermompnn-splits mega_splits.pkl \
+    --antisymmetric \
+    --batch-size 1024 \
+    --epochs 50
+
+# Train with HuggingFace CV splits
+uv run python -m src.training.train_mpnn --fold 0
+
+# Full 5-fold CV
+uv run python -m src.training.train_mpnn
 ```
 
 ### Evaluation
 
+**MPNN per-protein evaluation:**
 ```bash
-# Evaluate on test set
+# Evaluate trained model with per-protein breakdown
+uv run python -m src.training.eval_mpnn outputs/YYYYMMDD_HHMMSS_run_name/
+
+# Evaluate on validation split, sorted by RMSE
+uv run python -m src.training.eval_mpnn outputs/run_dir/ --split val --sort-by rmse
+
+# Show top 50 worst/best proteins
+uv run python -m src.training.eval_mpnn outputs/run_dir/ --top-n 50
+```
+
+**MLP evaluation:**
+```bash
 uv run python scripts/evaluate.py --all-folds
-
-# Per-protein breakdown
-uv run python scripts/evaluate.py --fold 0 --per-protein
-
-# Run ablation study
 uv run python scripts/evaluate.py --all-folds --ablation-suite
 ```
 
@@ -90,8 +119,9 @@ For each mutation at position `i`, we extract:
 
 **Total: 1577 dimensions**
 
-### Model
+### Models
 
+**MLP Model:**
 ```
 Features → [LayerNorm per group] → Concat → MLP(1577→512→512→256→1) → ΔΔG
 ```
@@ -100,6 +130,18 @@ Features → [LayerNorm per group] → Concat → MLP(1577→512→512→256→1
 - Separate LayerNorm for each feature group (raw embeddings have std ~400-600)
 - GELU activations, dropout 0.1
 - Trained with AdamW, cosine annealing, early stopping on validation Spearman
+
+**MPNN Model (ChaiMPNN):**
+```
+Local subgraph (k=30 neighbors) → Message Passing → Mutation site pooling → MLP → ΔΔG
+```
+
+- Graph neural network operating on Chai-1 embeddings
+- Node features: single embeddings (384-dim)
+- Edge features: pair embeddings (256-dim)
+- 3 message passing layers with edge-conditioned updates
+- Mutation identity encoding (WT/MUT amino acid + relative position)
+- Trained with AdamW, cosine annealing, early stopping
 
 ---
 
@@ -112,6 +154,12 @@ Features → [LayerNorm per group] → Concat → MLP(1577→512→512→256→1
 - ~298 proteins (32-72 aa)
 - 5-fold CV splits (by protein, no leakage)
 - Standard benchmark from ThermoMPNN
+
+### Splits
+
+Two split options are supported:
+- **HuggingFace CV splits**: Default 5-fold cross-validation from the dataset
+- **ThermoMPNN splits**: Official train/val/test splits from `mega_splits.pkl` for direct comparison with ThermoMPNN paper results
 
 ### Sign Convention
 
@@ -133,9 +181,12 @@ chai-thermo/
 │   ├── features/
 │   │   └── mutation_encoder.py # encode_mutation() + EmbeddingCache
 │   ├── models/
-│   │   └── pair_aware_mlp.py   # PairAwareMLP with LayerNorms
+│   │   ├── pair_aware_mlp.py   # PairAwareMLP with LayerNorms
+│   │   └── mpnn.py             # ChaiMPNN graph neural network
 │   └── training/
-│       ├── train.py            # Training loop + CV
+│       ├── train.py            # MLP training loop + CV
+│       ├── train_mpnn.py       # MPNN training (supports ThermoMPNN splits)
+│       ├── eval_mpnn.py        # Per-protein MPNN evaluation
 │       ├── sampler.py          # BalancedProteinSampler
 │       └── evaluate.py         # Metrics computation
 ├── scripts/
@@ -145,11 +196,17 @@ chai-thermo/
 │   └── embeddings/
 │       └── chai_trunk/         # Cached embeddings ({protein}.pt)
 └── outputs/
-    ├── fold_0/
+    ├── YYYYMMDD_HHMMSS_run_name/   # MPNN run directory
+    │   ├── config.json
+    │   ├── model.pt                # Final best model
+    │   ├── results.json            # Test metrics
+    │   ├── history.json            # Training history
+    │   ├── eval_test.csv           # Per-protein evaluation
+    │   └── checkpoint_epoch_*.pt   # Periodic checkpoints
+    ├── fold_0/                     # MLP fold directory
     │   ├── model.pt
     │   ├── config.json
     │   └── results.json
-    ├── ...
     └── cv_summary.json
 ```
 
@@ -192,6 +249,22 @@ Total storage: ~426 MB for 298 proteins.
 ### Balanced Sampling
 
 Each epoch samples uniformly across proteins (32 mutations per protein), preventing large proteins from dominating gradients.
+
+### Antisymmetric Loss (MPNN)
+
+Optional training augmentation that enforces physical reversibility:
+
+```
+Loss = MSE(pred(A→B), ΔΔG) + MSE(pred(B→A), -ΔΔG) + λ·MSE(pred(A→B) + pred(B→A), 0)
+```
+
+**Why it helps:**
+- Forces the model to learn that mutation effects are reversible
+- Acts as a regularizer, preventing memorization of "mutating to X is always bad"
+- Forces learning the context of the fit, not just amino acid identity
+- Particularly effective on de novo designs where signal-to-noise is lower
+
+Enable with `--antisymmetric` flag. Adjust consistency weight with `--antisymmetric-lambda` (default: 1.0).
 
 ---
 

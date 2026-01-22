@@ -182,6 +182,8 @@ class MPNNTrainingConfig:
     # Loss
     loss_fn: str = "mse"  # "mse" or "huber"
     huber_delta: float = 2.0
+    antisymmetric: bool = False  # Use antisymmetric loss (A→B and B→A should sum to 0)
+    antisymmetric_lambda: float = 1.0  # Weight for consistency term
 
     # Misc
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -385,6 +387,17 @@ def evaluate_mpnn(
     )
 
 
+def compute_loss(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    config: MPNNTrainingConfig,
+) -> torch.Tensor:
+    """Compute loss (MSE or Huber)."""
+    if config.loss_fn == "huber":
+        return F.huber_loss(preds, targets, delta=config.huber_delta)
+    return F.mse_loss(preds, targets)
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -400,14 +413,40 @@ def train_epoch(
     pbar = tqdm(dataloader, desc="Training", leave=False)
     for batch in pbar:
         batch = batch.to(device)
-        preds = model(batch).squeeze(-1)
         targets = batch.y.squeeze(-1)
 
-        # Loss
-        if config.loss_fn == "huber":
-            loss = F.huber_loss(preds, targets, delta=config.huber_delta)
+        # Forward prediction (A → B)
+        preds_fwd = model(batch).squeeze(-1)
+
+        if config.antisymmetric:
+            # Antisymmetric loss: train on both A→B and B→A
+            # For reverse, swap wt_idx and mut_idx
+            wt_idx_orig = batch.wt_idx.clone()
+            mut_idx_orig = batch.mut_idx.clone()
+
+            batch.wt_idx = mut_idx_orig
+            batch.mut_idx = wt_idx_orig
+
+            # Reverse prediction (B → A)
+            preds_rev = model(batch).squeeze(-1)
+
+            # Restore original indices
+            batch.wt_idx = wt_idx_orig
+            batch.mut_idx = mut_idx_orig
+
+            # Forward loss: pred(A→B) should match ddG
+            loss_fwd = compute_loss(preds_fwd, targets, config)
+
+            # Reverse loss: pred(B→A) should match -ddG
+            loss_rev = compute_loss(preds_rev, -targets, config)
+
+            # Consistency loss: pred(A→B) + pred(B→A) should equal 0
+            loss_consistency = F.mse_loss(preds_fwd + preds_rev, torch.zeros_like(preds_fwd))
+
+            loss = loss_fwd + loss_rev + config.antisymmetric_lambda * loss_consistency
         else:
-            loss = F.mse_loss(preds, targets)
+            # Standard loss
+            loss = compute_loss(preds_fwd, targets, config)
 
         # Backward
         optimizer.zero_grad()
@@ -686,6 +725,9 @@ def train_cv(
     logger.info(f"  epochs: {base_config.epochs}")
     logger.info(f"  patience: {base_config.patience}")
     logger.info(f"  loss_fn: {base_config.loss_fn}")
+    logger.info(f"  antisymmetric: {base_config.antisymmetric}")
+    if base_config.antisymmetric:
+        logger.info(f"  antisymmetric_lambda: {base_config.antisymmetric_lambda}")
     logger.info(f"  device: {base_config.device}")
     logger.info(f"  seed: {base_config.seed}")
     logger.info(f"{'=' * 50}\n")
@@ -788,6 +830,17 @@ def main():
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "huber"])
     parser.add_argument(
+        "--antisymmetric",
+        action="store_true",
+        help="Use antisymmetric loss: train on A→B and B→A with consistency constraint",
+    )
+    parser.add_argument(
+        "--antisymmetric-lambda",
+        type=float,
+        default=1.0,
+        help="Weight for antisymmetric consistency term (default: 1.0)",
+    )
+    parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -824,6 +877,8 @@ def main():
         learning_rate=args.lr,
         patience=args.patience,
         loss_fn=args.loss,
+        antisymmetric=args.antisymmetric,
+        antisymmetric_lambda=args.antisymmetric_lambda,
         device=args.device,
         seed=args.seed,
         thermompnn_splits=args.thermompnn_splits,
