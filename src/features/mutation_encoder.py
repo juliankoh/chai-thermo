@@ -117,11 +117,30 @@ def encode_mutation(
 
 
 class EmbeddingCache:
-    """Lazy-loading cache for protein embeddings."""
+    """
+    Lazy-loading cache for protein embeddings with optional LRU eviction.
 
-    def __init__(self, embedding_dir: Path | str):
+    Supports loading to CPU or GPU, with optional max cache size to prevent OOM.
+    """
+
+    def __init__(
+        self,
+        embedding_dir: Path | str,
+        device: str = "cpu",
+        max_cached: int | None = None,
+    ):
+        """
+        Args:
+            embedding_dir: Directory containing {protein_name}.pt files
+            device: Device to load embeddings to ("cpu", "cuda", etc.)
+            max_cached: Maximum proteins to keep in cache. None = unlimited.
+                        When set, uses LRU eviction to stay under limit.
+        """
         self.embedding_dir = Path(embedding_dir)
+        self.device = device
+        self.max_cached = max_cached
         self._cache: dict[str, tuple[Tensor, Tensor]] = {}
+        self._access_order: list[str] = []  # For LRU tracking
 
     def get(self, protein_name: str) -> tuple[Tensor, Tensor]:
         """
@@ -131,26 +150,48 @@ class EmbeddingCache:
             Tuple of (single [L, D_single], pair [L, L, D_pair]) as float32
         """
         if protein_name not in self._cache:
-            path = self.embedding_dir / f"{protein_name}.pt"
-            if not path.exists():
-                raise FileNotFoundError(f"No embedding file for {protein_name} at {path}")
+            self._load(protein_name)
 
-            data = torch.load(path, map_location="cpu", weights_only=False)
-            # Convert to float32 (embeddings may be stored as float16)
-            single = data["single"].float()
-            pair = data["pair"].float()
-            self._cache[protein_name] = (single, pair)
+        # Update LRU order (move to end = most recently used)
+        if self.max_cached is not None:
+            if protein_name in self._access_order:
+                self._access_order.remove(protein_name)
+            self._access_order.append(protein_name)
 
         return self._cache[protein_name]
 
+    def _load(self, protein_name: str) -> None:
+        """Load embeddings from disk."""
+        # Evict oldest if at capacity (LRU eviction)
+        if self.max_cached is not None:
+            while len(self._cache) >= self.max_cached:
+                oldest = self._access_order.pop(0)
+                del self._cache[oldest]
+
+        path = self.embedding_dir / f"{protein_name}.pt"
+        if not path.exists():
+            raise FileNotFoundError(f"No embedding file for {protein_name} at {path}")
+
+        data = torch.load(path, map_location=self.device, weights_only=True)
+        # Convert to float32 (embeddings may be stored as float16)
+        single = data["single"].float()
+        pair = data["pair"].float()
+        self._cache[protein_name] = (single, pair)
+
+        if self.max_cached is not None:
+            self._access_order.append(protein_name)
+
     def preload(self, protein_names: list[str]) -> None:
         """Preload embeddings for a list of proteins."""
-        for name in protein_names:
-            self.get(name)
+        limit = self.max_cached if self.max_cached is not None else len(protein_names)
+        for name in protein_names[:limit]:
+            if name not in self._cache:
+                self._load(name)
 
     def clear(self) -> None:
         """Clear the cache."""
         self._cache.clear()
+        self._access_order.clear()
 
     @property
     def loaded_proteins(self) -> list[str]:

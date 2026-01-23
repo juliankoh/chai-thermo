@@ -1,15 +1,13 @@
 """Training loop for MPNN-based protein stability prediction.
 
 Uses PyTorch Geometric for graph batching and message passing.
-Supports ThermoMPNN splits for fair comparison.
+Uses ThermoMPNN splits for training/validation/test.
 """
 
 import argparse
-import json
 import logging
-import pickle
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -23,147 +21,33 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-import pandas as pd
-
-from src.data.dataset import MegaScaleDataset, parse_mutation, get_wt_sequence, MutationSample
 from src.data.graph_builder import GraphEmbeddingCache
+from src.data.megascale_loader import ThermoMPNNSplitDatasetParquet
 from src.models.mpnn import ChaiMPNN, ChaiMPNNWithMutationInfo
+from src.training.common import (
+    BaseTrainingConfig,
+    EarlyStopping,
+    TrainingHistory,
+    log_epoch,
+    run_training,
+    save_checkpoint,
+)
+from src.training.evaluate import EvaluationResults, compute_metrics
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# ThermoMPNN Splits Support (shared with train.py)
+# Configuration
 # =============================================================================
-
-DEFAULT_MEGASCALE_PATH = "data/megascale.parquet"
-_MEGASCALE_CACHE = None
-
-
-def _get_megascale_data(data_path: str | Path | None = None) -> pd.DataFrame:
-    """Load MegaScale data from local parquet file (cached)."""
-    global _MEGASCALE_CACHE
-
-    if _MEGASCALE_CACHE is not None:
-        return _MEGASCALE_CACHE
-
-    path = Path(data_path) if data_path else Path(DEFAULT_MEGASCALE_PATH)
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"MegaScale data not found at {path}. "
-            f"Run 'uv run python scripts/download_megascale.py' first."
-        )
-
-    logger.info(f"Loading MegaScale data from {path}...")
-    _MEGASCALE_CACHE = pd.read_parquet(path)
-    logger.info(f"Loaded {len(_MEGASCALE_CACHE)} mutations from {_MEGASCALE_CACHE['WT_name'].nunique()} proteins")
-
-    return _MEGASCALE_CACHE
-
-
-class ThermoMPNNSplitDataset(Dataset):
-    """MegaScale dataset using ThermoMPNN's official splits."""
-
-    AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY"
-    AA_TO_IDX = {aa: i for i, aa in enumerate(AA_VOCAB)}
-
-    def __init__(
-        self,
-        splits_file: str | Path,
-        split: str = "train",
-        cv_fold: Optional[int] = None,
-        data_path: str | Path | None = None,
-    ):
-        self.splits_file = Path(splits_file)
-        self.split = split
-
-        # Load splits
-        with open(splits_file, 'rb') as f:
-            splits = pickle.load(f)
-
-        # Determine which key to use
-        if cv_fold is not None:
-            split_key = f"cv_{split}_{cv_fold}"
-        else:
-            split_key = split
-
-        if split_key not in splits:
-            raise ValueError(f"Split '{split_key}' not found in {splits_file}")
-
-        # Get protein names for this split
-        target_proteins = set()
-        for p in splits[split_key]:
-            if hasattr(p, 'item'):
-                p = p.item()
-            target_proteins.add(p.replace('.pdb', ''))
-
-        logger.info(f"Split '{split_key}': {len(target_proteins)} proteins")
-
-        # Load from local parquet file
-        df = _get_megascale_data(data_path)
-
-        # Filter to target proteins
-        df_filtered = df[df['WT_name'].str.replace('.pdb', '', regex=False).isin(target_proteins)]
-
-        # Convert to list of dicts for compatibility
-        self.data = df_filtered.to_dict('records')
-        logger.info(f"Found {len(self.data)} mutations for {split_key}")
-
-        # Build WT sequence cache
-        self._wt_cache: dict[str, str] = {}
-        self._build_wt_cache()
-
-    def _build_wt_cache(self) -> None:
-        for row in self.data:
-            wt_name = row["WT_name"]
-            if wt_name not in self._wt_cache:
-                self._wt_cache[wt_name] = get_wt_sequence(row["aa_seq"], row["mut_type"])
-
-    def get_wt_sequence(self, wt_name: str) -> str:
-        return self._wt_cache[wt_name]
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, idx: int) -> MutationSample:
-        row = self.data[idx]
-        wt_aa, pos_1idx, mut_aa = parse_mutation(row["mut_type"])
-        ddg_standard = -row["ddG_ML"]
-
-        return MutationSample(
-            wt_name=row["WT_name"],
-            wt_sequence=self.get_wt_sequence(row["WT_name"]),
-            mut_sequence=row["aa_seq"],
-            position=pos_1idx - 1,
-            wt_residue=wt_aa,
-            mut_residue=mut_aa,
-            ddg=ddg_standard,
-        )
-
-    @property
-    def unique_proteins(self) -> list[str]:
-        return list(self._wt_cache.keys())
-
-    def encode_residue(self, aa: str) -> int:
-        return self.AA_TO_IDX.get(aa, 20)
 
 
 @dataclass
-class MPNNTrainingConfig:
+class MPNNTrainingConfig(BaseTrainingConfig):
     """Training hyperparameters for MPNN."""
 
-    # Run identification
-    run_name: Optional[str] = None
     model_type: str = "chai_mpnn"
-
-    # Data
-    fold: int = 0
-    embedding_dir: str = "data/embeddings/chai_trunk"
-    data_path: str = "data/megascale.parquet"  # Path to local MegaScale data
-    thermompnn_splits: Optional[str] = None  # Path to mega_splits.pkl
-    thermompnn_cv_fold: Optional[int] = None  # Use ThermoMPNN's CV fold instead of main split
 
     # Model architecture
     node_in_dim: int = 384  # Chai single embedding dim
@@ -178,33 +62,20 @@ class MPNNTrainingConfig:
     # Graph construction
     k_neighbors: int = 30
 
-    # Training
+    # Training (override defaults)
     batch_size: int = 64
     learning_rate: float = 3e-4
-    weight_decay: float = 0.01
-    epochs: int = 100
-    patience: int = 15
-    gradient_clip: float = 1.0
 
     # Loss
     loss_fn: str = "mse"  # "mse" or "huber"
     huber_delta: float = 2.0
-    antisymmetric: bool = False  # Use antisymmetric loss (A→B and B→A should sum to 0)
+    antisymmetric: bool = False  # Use antisymmetric loss
     antisymmetric_lambda: float = 1.0  # Weight for consistency term
 
-    # Misc
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    seed: int = 42
-    output_dir: str = "outputs"
 
-    def save(self, path: Path) -> None:
-        with open(path, "w") as f:
-            json.dump(asdict(self), f, indent=2)
-
-    @classmethod
-    def load(cls, path: Path) -> "MPNNTrainingConfig":
-        with open(path) as f:
-            return cls(**json.load(f))
+# =============================================================================
+# Graph Dataset
+# =============================================================================
 
 
 def build_edge_index(num_nodes: int, device: torch.device) -> torch.Tensor:
@@ -224,7 +95,7 @@ class MutationGraphDataset(Dataset):
 
     def __init__(
         self,
-        megascale_dataset: MegaScaleDataset,
+        megascale_dataset,
         graph_cache: GraphEmbeddingCache,
         k_neighbors: int = 30,
         device: str = "cuda",
@@ -307,108 +178,60 @@ class MutationGraphDataset(Dataset):
         )
 
 
-@dataclass
-class EvaluationResults:
-    """Evaluation metrics."""
-
-    mean_spearman: float
-    std_spearman: float
-    median_spearman: float
-    mean_pearson: float
-    std_pearson: float
-    median_pearson: float
-    global_spearman: float
-    global_pearson: float
-    rmse: float
-    mae: float
-    n_proteins: int
-    n_mutations: int
-
-    def summary(self) -> str:
-        return (
-            f"Mean Spearman: {self.mean_spearman:.4f} ± {self.std_spearman:.4f}\n"
-            f"Mean Pearson:  {self.mean_pearson:.4f} ± {self.std_pearson:.4f}\n"
-            f"Global Spearman: {self.global_spearman:.4f}\n"
-            f"Global Pearson:  {self.global_pearson:.4f}\n"
-            f"RMSE: {self.rmse:.4f}, MAE: {self.mae:.4f}\n"
-            f"Proteins: {self.n_proteins}, Mutations: {self.n_mutations}"
-        )
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        # Convert numpy types to Python types for JSON serialization
-        for k, v in d.items():
-            if hasattr(v, 'item'):
-                d[k] = v.item()
-        return d
+# =============================================================================
+# Evaluation
+# =============================================================================
 
 
 def evaluate_mpnn(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    megascale_dataset: MegaScaleDataset,
+    graph_dataset: MutationGraphDataset,
+    min_mutations: int = 10,
 ) -> EvaluationResults:
-    """Evaluate MPNN model on a dataset."""
-    import numpy as np
-    from scipy.stats import pearsonr, spearmanr
+    """
+    Evaluate MPNN model on a dataset.
 
+    Args:
+        model: The MPNN model to evaluate
+        dataloader: DataLoader with shuffle=False to preserve order
+        device: Device to run on
+        graph_dataset: MutationGraphDataset (has samples with protein info)
+        min_mutations: Minimum mutations per protein for per-protein metrics
+
+    Returns:
+        EvaluationResults with all metrics
+    """
     model.eval()
-    all_preds = []
-    all_targets = []
-    all_proteins = []
+
+    # Collect predictions in dataset order (dataloader must have shuffle=False)
+    all_preds: list[float] = []
+    all_targets: list[float] = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
             batch = batch.to(device)
             preds = model(batch).squeeze(-1)
 
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(batch.y.squeeze(-1).cpu().numpy())
+            all_preds.extend(preds.cpu().tolist())
+            all_targets.extend(batch.y.squeeze(-1).cpu().tolist())
 
-    # We need protein assignments for per-protein metrics
-    # Since PyG batching loses this info, we'll reconstruct it
-    preds = np.array(all_preds)
-    targets = np.array(all_targets)
+    # Group by protein using dataset's sample info
+    predictions: dict[str, list[float]] = defaultdict(list)
+    targets: dict[str, list[float]] = defaultdict(list)
 
-    # Get protein names directly from underlying data (faster)
-    protein_names = [megascale_dataset.data[i]["WT_name"] for i in range(len(megascale_dataset))]
+    for i, (pred, target) in enumerate(zip(all_preds, all_targets)):
+        protein = graph_dataset.samples[i]["protein"]
+        predictions[protein].append(pred)
+        targets[protein].append(target)
 
-    # Per-protein correlations
-    unique_proteins = list(set(protein_names))
-    spearmans = []
-    pearsons = []
+    return compute_metrics(predictions, targets, min_mutations=min_mutations)
 
-    for prot in unique_proteins:
-        mask = np.array([p == prot for p in protein_names])
-        if mask.sum() < 3:
-            continue
-        p_preds = preds[mask]
-        p_targets = targets[mask]
-        if np.std(p_preds) > 1e-6 and np.std(p_targets) > 1e-6:
-            spearmans.append(spearmanr(p_preds, p_targets)[0])
-            pearsons.append(pearsonr(p_preds, p_targets)[0])
 
-    # Global metrics
-    global_spearman = spearmanr(preds, targets)[0]
-    global_pearson = pearsonr(preds, targets)[0]
-    rmse = np.sqrt(np.mean((preds - targets) ** 2))
-    mae = np.mean(np.abs(preds - targets))
-
-    return EvaluationResults(
-        mean_spearman=np.mean(spearmans) if spearmans else 0.0,
-        std_spearman=np.std(spearmans) if spearmans else 0.0,
-        median_spearman=np.median(spearmans) if spearmans else 0.0,
-        mean_pearson=np.mean(pearsons) if pearsons else 0.0,
-        std_pearson=np.std(pearsons) if pearsons else 0.0,
-        median_pearson=np.median(pearsons) if pearsons else 0.0,
-        global_spearman=global_spearman,
-        global_pearson=global_pearson,
-        rmse=rmse,
-        mae=mae,
-        n_proteins=len(unique_proteins),
-        n_mutations=len(preds),
-    )
+# =============================================================================
+# Loss Computation
+# =============================================================================
 
 
 def compute_loss(
@@ -420,6 +243,11 @@ def compute_loss(
     if config.loss_fn == "huber":
         return F.huber_loss(preds, targets, delta=config.huber_delta)
     return F.mse_loss(preds, targets)
+
+
+# =============================================================================
+# Training Functions
+# =============================================================================
 
 
 def train_epoch(
@@ -439,32 +267,31 @@ def train_epoch(
         batch = batch.to(device)
         targets = batch.y.squeeze(-1)
 
-        # Forward prediction (A → B)
+        # Forward prediction (A -> B)
         preds_fwd = model(batch).squeeze(-1)
 
         if config.antisymmetric:
-            # Antisymmetric loss: train on both A→B and B→A
-            # For reverse, swap wt_idx and mut_idx
+            # Antisymmetric loss: train on both A->B and B->A
             wt_idx_orig = batch.wt_idx.clone()
             mut_idx_orig = batch.mut_idx.clone()
 
             batch.wt_idx = mut_idx_orig
             batch.mut_idx = wt_idx_orig
 
-            # Reverse prediction (B → A)
+            # Reverse prediction (B -> A)
             preds_rev = model(batch).squeeze(-1)
 
             # Restore original indices
             batch.wt_idx = wt_idx_orig
             batch.mut_idx = mut_idx_orig
 
-            # Forward loss: pred(A→B) should match ddG
+            # Forward loss: pred(A->B) should match ddG
             loss_fwd = compute_loss(preds_fwd, targets, config)
 
-            # Reverse loss: pred(B→A) should match -ddG
+            # Reverse loss: pred(B->A) should match -ddG
             loss_rev = compute_loss(preds_rev, -targets, config)
 
-            # Consistency loss: pred(A→B) + pred(B→A) should equal 0
+            # Consistency loss: pred(A->B) + pred(B->A) should equal 0
             loss_consistency = F.mse_loss(preds_fwd + preds_rev, torch.zeros_like(preds_fwd))
 
             loss = loss_fwd + loss_rev + config.antisymmetric_lambda * loss_consistency
@@ -484,26 +311,19 @@ def train_epoch(
         total_loss += loss.item()
         n_batches += 1
 
-        # Update progress bar with running loss
         pbar.set_postfix(loss=f"{total_loss / n_batches:.4f}")
 
     return total_loss / n_batches
 
 
-def train_fold(
+def train(
     config: MPNNTrainingConfig,
     verbose: bool = True,
     checkpoint_dir: Path | None = None,
     checkpoint_interval: int = 20,
-) -> tuple[nn.Module, EvaluationResults, dict]:
+) -> tuple[nn.Module, EvaluationResults, TrainingHistory]:
     """
-    Train on a single fold.
-
-    Args:
-        config: Training configuration
-        verbose: Whether to log progress
-        checkpoint_dir: Directory to save checkpoints (None = no checkpoints)
-        checkpoint_interval: Save checkpoint every N epochs
+    Train MPNN model.
 
     Returns:
         Tuple of (trained model, test results, training history)
@@ -513,36 +333,26 @@ def train_fold(
     # Set seed
     torch.manual_seed(config.seed)
 
-    # Load datasets
-    if config.thermompnn_splits:
-        # Use ThermoMPNN's official splits
-        if verbose:
-            logger.info(f"Using ThermoMPNN splits from {config.thermompnn_splits}")
-            if config.thermompnn_cv_fold is not None:
-                logger.info(f"Using ThermoMPNN CV fold {config.thermompnn_cv_fold}")
-            else:
-                logger.info("Using ThermoMPNN main train/val/test split")
+    # Load datasets using ThermoMPNN splits
+    if verbose:
+        logger.info(f"Using splits from {config.splits_file}")
+        if config.cv_fold is not None:
+            logger.info(f"Using CV fold {config.cv_fold}")
+        else:
+            logger.info("Using main train/val/test split")
 
-        train_megascale = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="train", cv_fold=config.thermompnn_cv_fold,
-            data_path=config.data_path,
-        )
-        val_megascale = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="val", cv_fold=config.thermompnn_cv_fold,
-            data_path=config.data_path,
-        )
-        test_megascale = ThermoMPNNSplitDataset(
-            config.thermompnn_splits, split="test", cv_fold=config.thermompnn_cv_fold,
-            data_path=config.data_path,
-        )
-    else:
-        # Use HuggingFace's CV splits (default)
-        if verbose:
-            logger.info(f"Loading HuggingFace fold {config.fold}...")
-
-        train_megascale = MegaScaleDataset(fold=config.fold, split="train")
-        val_megascale = MegaScaleDataset(fold=config.fold, split="val")
-        test_megascale = MegaScaleDataset(fold=config.fold, split="test")
+    train_megascale = ThermoMPNNSplitDatasetParquet(
+        config.splits_file, split="train", cv_fold=config.cv_fold,
+        data_path=config.data_path,
+    )
+    val_megascale = ThermoMPNNSplitDatasetParquet(
+        config.splits_file, split="val", cv_fold=config.cv_fold,
+        data_path=config.data_path,
+    )
+    test_megascale = ThermoMPNNSplitDatasetParquet(
+        config.splits_file, split="test", cv_fold=config.cv_fold,
+        data_path=config.data_path,
+    )
 
     if verbose:
         logger.info(
@@ -623,217 +433,74 @@ def train_fold(
     )
 
     # Scheduler
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=config.T_0, T_mult=config.T_mult)
+
+    # Early stopping
+    early_stopping = EarlyStopping(patience=config.patience, mode="max")
 
     # Training loop
-    history = {
-        "train_loss": [],
-        "val_spearman": [],
-        "val_rmse": [],
-    }
-
-    best_val_spearman = -1.0
-    best_model_state = None
-    patience_counter = 0
+    history = TrainingHistory()
 
     for epoch in range(config.epochs):
         # Train
         train_loss = train_epoch(model, train_loader, optimizer, config, device)
-        history["train_loss"].append(float(train_loss))
+        history.append_train_loss(train_loss)
 
         scheduler.step()
 
-        # Validate every 5 epochs (or first epoch) to reduce overhead
+        # Validate every 5 epochs (or first epoch)
         eval_interval = 5
         should_eval = (epoch + 1) % eval_interval == 0 or epoch == 0
 
         if should_eval:
-            val_results = evaluate_mpnn(model, val_loader, device, val_megascale)
-            history["val_spearman"].append(float(val_results.mean_spearman))
-            history["val_rmse"].append(float(val_results.rmse))
+            val_results = evaluate_mpnn(model, val_loader, device, val_dataset)
+            history.append_val_metrics(val_results.mean_spearman, val_results.rmse)
 
             if verbose:
-                logger.info(
-                    f"Epoch {epoch + 1}/{config.epochs} | "
-                    f"Loss: {train_loss:.4f} | "
-                    f"Val Spearman: {val_results.mean_spearman:.4f} | "
-                    f"Val RMSE: {val_results.rmse:.4f}"
-                )
+                log_epoch(epoch, config.epochs, train_loss, val_results)
 
-            # Early stopping (only check when we validate)
-            if val_results.mean_spearman > best_val_spearman:
-                best_val_spearman = val_results.mean_spearman
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= config.patience:
-                    if verbose:
-                        logger.info(f"Early stopping at epoch {epoch + 1}")
-                    break
+            # Early stopping check
+            improved = early_stopping(val_results.mean_spearman, model)
+            if early_stopping.should_stop:
+                if verbose:
+                    logger.info(f"Early stopping at epoch {epoch + 1}")
+                break
         else:
             if verbose:
-                logger.info(f"Epoch {epoch + 1}/{config.epochs} | Loss: {train_loss:.4f}")
+                log_epoch(epoch, config.epochs, train_loss)
 
         # Periodic checkpoint saving
         if checkpoint_dir is not None and (epoch + 1) % checkpoint_interval == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "best_val_spearman": best_val_spearman,
-            }, checkpoint_path)
-            if verbose:
-                logger.info(f"Saved checkpoint: {checkpoint_path}")
+            save_checkpoint(
+                checkpoint_dir, epoch + 1, model, optimizer, scheduler,
+                early_stopping.best_score or 0.0
+            )
 
     # Load best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        model.to(device)
+    early_stopping.load_best_model(model, config.device)
 
     # Final test evaluation
-    test_results = evaluate_mpnn(model, test_loader, device, test_megascale)
+    test_results = evaluate_mpnn(model, test_loader, device, test_dataset)
 
     if verbose:
-        logger.info(f"\nTest Results (Fold {config.fold}):")
+        logger.info("\nTest Results:")
         logger.info(test_results.summary())
 
     return model, test_results, history
 
 
-def generate_run_dir(base_output_dir: str, config: MPNNTrainingConfig) -> Path:
-    """Generate a unique run directory name with timestamp and model info."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    if config.run_name:
-        run_dir_name = f"{timestamp}_{config.run_name}"
-    else:
-        run_dir_name = f"{timestamp}_{config.model_type}"
-
-    return Path(base_output_dir) / run_dir_name
-
-
-def train_cv(
-    base_config: MPNNTrainingConfig,
-    folds: list[int] = [0, 1, 2, 3, 4],
-    save_models: bool = True,
-) -> dict:
-    """
-    Train on all CV folds and aggregate results.
-
-    Returns:
-        Dict with per-fold and aggregated results
-    """
-    import numpy as np
-
-    # Create timestamped run directory
-    run_dir = generate_run_dir(base_config.output_dir, base_config)
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"Run directory: {run_dir}")
-
-    # Log hyperparameters
-    logger.info(f"\n{'=' * 50}")
-    logger.info("Hyperparameters")
-    logger.info(f"{'=' * 50}")
-    logger.info(f"  Model: {base_config.model_type}")
-    logger.info(f"  hidden_dim: {base_config.hidden_dim}")
-    logger.info(f"  edge_hidden_dim: {base_config.edge_hidden_dim}")
-    logger.info(f"  num_layers: {base_config.num_layers}")
-    logger.info(f"  k_neighbors: {base_config.k_neighbors}")
-    logger.info(f"  dropout: {base_config.dropout}")
-    logger.info(f"  use_global_pool: {base_config.use_global_pool}")
-    logger.info(f"  use_mutation_info: {base_config.use_mutation_info}")
-    logger.info(f"  batch_size: {base_config.batch_size}")
-    logger.info(f"  learning_rate: {base_config.learning_rate}")
-    logger.info(f"  weight_decay: {base_config.weight_decay}")
-    logger.info(f"  epochs: {base_config.epochs}")
-    logger.info(f"  patience: {base_config.patience}")
-    logger.info(f"  loss_fn: {base_config.loss_fn}")
-    logger.info(f"  antisymmetric: {base_config.antisymmetric}")
-    if base_config.antisymmetric:
-        logger.info(f"  antisymmetric_lambda: {base_config.antisymmetric_lambda}")
-    logger.info(f"  device: {base_config.device}")
-    logger.info(f"  seed: {base_config.seed}")
-    logger.info(f"{'=' * 50}\n")
-
-    # Save config once at run level
-    base_config.save(run_dir / "config.json")
-
-    all_results = []
-    all_histories = []
-
-    for fold in folds:
-        logger.info(f"\n{'=' * 50}")
-        logger.info(f"Training Fold {fold}")
-        logger.info(f"{'=' * 50}")
-
-        config = MPNNTrainingConfig(**{**asdict(base_config), "fold": fold})
-
-        # Create fold directory for checkpoints
-        fold_dir = run_dir / f"fold_{fold}"
-        fold_dir.mkdir(exist_ok=True)
-
-        model, test_results, history = train_fold(
-            config, verbose=True, checkpoint_dir=fold_dir, checkpoint_interval=20
-        )
-
-        all_results.append(test_results)
-        all_histories.append(history)
-
-        # Save model and results per fold
-        if save_models:
-            torch.save(model.state_dict(), fold_dir / "model.pt")
-
-            with open(fold_dir / "results.json", "w") as f:
-                json.dump(test_results.to_dict(), f, indent=2)
-
-            with open(fold_dir / "history.json", "w") as f:
-                json.dump(history, f, indent=2)
-
-    # Aggregate results
-    spearmans = [r.mean_spearman for r in all_results]
-    pearsons = [r.mean_pearson for r in all_results]
-    rmses = [r.rmse for r in all_results]
-
-    cv_summary = {
-        "mean_spearman": float(np.mean(spearmans)),
-        "std_spearman": float(np.std(spearmans)),
-        "mean_pearson": float(np.mean(pearsons)),
-        "std_pearson": float(np.std(pearsons)),
-        "mean_rmse": float(np.mean(rmses)),
-        "std_rmse": float(np.std(rmses)),
-        "per_fold": [r.to_dict() for r in all_results],
-    }
-
-    logger.info(f"\n{'=' * 50}")
-    logger.info("Cross-Validation Summary")
-    logger.info(f"{'=' * 50}")
-    logger.info(
-        f"Mean Spearman: {cv_summary['mean_spearman']:.4f} ± {cv_summary['std_spearman']:.4f}"
-    )
-    logger.info(
-        f"Mean Pearson:  {cv_summary['mean_pearson']:.4f} ± {cv_summary['std_pearson']:.4f}"
-    )
-    logger.info(f"Mean RMSE:     {cv_summary['mean_rmse']:.4f} ± {cv_summary['std_rmse']:.4f}")
-
-    # Save summary
-    with open(run_dir / "cv_summary.json", "w") as f:
-        json.dump(cv_summary, f, indent=2)
-
-    logger.info(f"\nResults saved to: {run_dir}")
-
-    return cv_summary
+# =============================================================================
+# CLI
+# =============================================================================
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train MPNN stability predictor")
-    parser.add_argument(
-        "--fold", type=int, default=None, help="Single fold to train (0-4), or None for all"
-    )
     parser.add_argument("--run-name", type=str, default=None, help="Name for this training run")
+    parser.add_argument("--splits-file", type=str, default="data/mega_splits.pkl",
+                        help="Path to mega_splits.pkl")
+    parser.add_argument("--cv-fold", type=int, default=None,
+                        help="CV fold (0-4) within splits, or None for main split")
     parser.add_argument("--embedding-dir", type=str, default="data/embeddings/chai_trunk")
     parser.add_argument("--data-path", type=str, default="data/megascale.parquet",
                         help="Path to local MegaScale parquet file")
@@ -844,13 +511,9 @@ def main():
     parser.add_argument("--edge-hidden-dim", type=int, default=128, help="Edge hidden dimension")
     parser.add_argument("--num-layers", type=int, default=3, help="Number of MPNN layers")
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument(
-        "--k-neighbors", type=int, default=30, help="Number of neighbors in subgraph"
-    )
+    parser.add_argument("--k-neighbors", type=int, default=30, help="Number of neighbors in subgraph")
     parser.add_argument("--no-global-pool", action="store_true", help="Disable global pooling")
-    parser.add_argument(
-        "--no-mutation-info", action="store_true", help="Don't use mutation identity info"
-    )
+    parser.add_argument("--no-mutation-info", action="store_true", help="Don't use mutation identity info")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100)
@@ -858,40 +521,19 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "huber"])
-    parser.add_argument(
-        "--antisymmetric",
-        action="store_true",
-        help="Use antisymmetric loss: train on A→B and B→A with consistency constraint",
-    )
-    parser.add_argument(
-        "--antisymmetric-lambda",
-        type=float,
-        default=1.0,
-        help="Weight for antisymmetric consistency term (default: 1.0)",
-    )
-    parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
-    )
+    parser.add_argument("--antisymmetric", action="store_true",
+                        help="Use antisymmetric loss: train on A->B and B->A with consistency constraint")
+    parser.add_argument("--antisymmetric-lambda", type=float, default=1.0,
+                        help="Weight for antisymmetric consistency term (default: 1.0)")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
-
-    # ThermoMPNN splits
-    parser.add_argument(
-        "--thermompnn-splits",
-        type=str,
-        default=None,
-        help="Path to mega_splits.pkl for ThermoMPNN's official splits",
-    )
-    parser.add_argument(
-        "--thermompnn-cv-fold",
-        type=int,
-        default=None,
-        help="Use ThermoMPNN CV fold (0-4) instead of main train/val/test split",
-    )
 
     args = parser.parse_args()
 
     config = MPNNTrainingConfig(
         run_name=args.run_name,
+        splits_file=args.splits_file,
+        cv_fold=args.cv_fold,
         embedding_dir=args.embedding_dir,
         data_path=args.data_path,
         output_dir=args.output_dir,
@@ -911,41 +553,9 @@ def main():
         antisymmetric_lambda=args.antisymmetric_lambda,
         device=args.device,
         seed=args.seed,
-        thermompnn_splits=args.thermompnn_splits,
-        thermompnn_cv_fold=args.thermompnn_cv_fold,
     )
 
-    if config.thermompnn_splits:
-        # ThermoMPNN splits: train a single model (not CV)
-        logger.info("Training with ThermoMPNN splits (single model, no CV)")
-
-        # Create run directory
-        run_dir = generate_run_dir(config.output_dir, config)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Run directory: {run_dir}")
-
-        # Save config
-        config.save(run_dir / "config.json")
-
-        model, test_results, history = train_fold(
-            config, verbose=True, checkpoint_dir=run_dir, checkpoint_interval=20
-        )
-
-        # Save final model and results
-        torch.save(model.state_dict(), run_dir / "model.pt")
-
-        with open(run_dir / "results.json", "w") as f:
-            json.dump(test_results.to_dict(), f, indent=2)
-
-        with open(run_dir / "history.json", "w") as f:
-            json.dump(history, f, indent=2)
-
-        logger.info(f"\nResults saved to: {run_dir}")
-    elif args.fold is not None:
-        config.fold = args.fold
-        train_fold(config, verbose=True)
-    else:
-        train_cv(config)
+    run_training(config, train)
 
 
 if __name__ == "__main__":

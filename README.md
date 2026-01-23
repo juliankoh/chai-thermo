@@ -1,18 +1,8 @@
 # Chai-1 Stability Predictor
 
-**Protein stability (ΔΔG) prediction using Chai-1's pair representations.**
+**Protein stability (ddG) prediction using Chai-1's pair representations.**
 
-## Results
-
-**5-Fold Cross-Validation on MegaScale `dataset3_single_cv`:**
-
-| Metric | Result |
-|--------|--------|
-| **Mean Spearman** | **0.716 ± 0.006** |
-| Mean Pearson | 0.755 ± 0.009 |
-| Mean RMSE | 0.68 kcal/mol |
-
-This significantly exceeds initial targets (0.55 Spearman) and validates the hypothesis that Chai-1's explicit pair representations capture stability-relevant structural information.
+Uses ThermoMPNN's official data splits for training and evaluation.
 
 ---
 
@@ -22,6 +12,7 @@ This significantly exceeds initial targets (0.55 Spearman) and validates the hyp
 
 - Python 3.10+
 - Pre-extracted Chai-1 embeddings in `data/embeddings/chai_trunk/`
+- ThermoMPNN splits file (`data/mega_splits.pkl`)
 
 ### Installation
 
@@ -40,38 +31,32 @@ This creates `data/megascale.parquet` which is used by training/eval scripts.
 
 ### Training
 
-**MLP Model (original):**
+**MLP Model:**
 ```bash
-# Train on a single fold
-uv run python -m src.training.train --fold 0 --embedding-dir data/embeddings/chai_trunk
-
-# Train all 5 folds (full cross-validation)
-uv run python -m src.training.train --embedding-dir data/embeddings/chai_trunk
+uv run python -m src.training.train_mlp --run-name mlp_baseline
 ```
 
 **MPNN Model:**
 ```bash
-# Train with ThermoMPNN's official splits
-uv run python -m src.training.train_mpnn \
-    --run-name mpnn_thermompnn_splits \
-    --thermompnn-splits mega_splits.pkl \
-    --batch-size 1024 \
-    --epochs 50
+# Standard training
+uv run python -m src.training.train_mpnn --run-name mpnn_baseline
 
 # With antisymmetric loss (recommended for better generalization)
 uv run python -m src.training.train_mpnn \
     --run-name mpnn_antisym \
-    --thermompnn-splits mega_splits.pkl \
     --antisymmetric \
-    --batch-size 1024 \
-    --epochs 50
-
-# Train with HuggingFace CV splits
-uv run python -m src.training.train_mpnn --fold 0
-
-# Full 5-fold CV
-uv run python -m src.training.train_mpnn
+    --batch-size 1024
 ```
+
+**Transformer Model:**
+```bash
+uv run python -m src.training.train_transformer --run-name transformer_baseline
+```
+
+All training scripts support:
+- `--splits-file PATH` - Path to mega_splits.pkl (default: `data/mega_splits.pkl`)
+- `--cv-fold N` - Use CV fold 0-4 within splits, or omit for main split
+- `--run-name NAME` - Name for this training run
 
 ### Evaluation
 
@@ -82,15 +67,6 @@ uv run python -m src.training.eval_mpnn outputs/YYYYMMDD_HHMMSS_run_name/
 
 # Evaluate on validation split, sorted by RMSE
 uv run python -m src.training.eval_mpnn outputs/run_dir/ --split val --sort-by rmse
-
-# Show top 50 worst/best proteins
-uv run python -m src.training.eval_mpnn outputs/run_dir/ --top-n 50
-```
-
-**MLP evaluation:**
-```bash
-uv run python scripts/evaluate.py --all-folds
-uv run python scripts/evaluate.py --all-folds --ablation-suite
 ```
 
 ### Verification (run before training)
@@ -122,7 +98,7 @@ For each mutation at position `i`, we extract:
 | `local_single` | 384 | Embedding of mutated residue |
 | `global_single` | 384 | Protein-average embedding |
 | `pair_global` | 256 | Average pairwise interactions (excl. self) |
-| `pair_local_seq` | 256 | Interactions with sequence neighbors ±5 |
+| `pair_local_seq` | 256 | Interactions with sequence neighbors +/-5 |
 | `pair_structural` | 256 | Top-10 strongest long-range contacts |
 | `mutation_feat` | 41 | WT/MUT one-hots + relative position |
 
@@ -132,7 +108,7 @@ For each mutation at position `i`, we extract:
 
 **MLP Model:**
 ```
-Features → [LayerNorm per group] → Concat → MLP(1577→512→512→256→1) → ΔΔG
+Features -> [LayerNorm per group] -> Concat -> MLP(1577->512->512->256->1) -> ddG
 ```
 
 - **~1.2M parameters**
@@ -142,7 +118,7 @@ Features → [LayerNorm per group] → Concat → MLP(1577→512→512→256→1
 
 **MPNN Model (ChaiMPNN):**
 ```
-Local subgraph (k=30 neighbors) → Message Passing → Mutation site pooling → MLP → ΔΔG
+Local subgraph (k=30 neighbors) -> Message Passing -> Mutation site pooling -> MLP -> ddG
 ```
 
 - Graph neural network operating on Chai-1 embeddings
@@ -152,29 +128,50 @@ Local subgraph (k=30 neighbors) → Message Passing → Mutation site pooling �
 - Mutation identity encoding (WT/MUT amino acid + relative position)
 - Trained with AdamW, cosine annealing, early stopping
 
+**Transformer Model (ChaiThermoTransformer):**
+```
+Single embeddings -> Transformer (pair embeddings as attention bias) -> Site pooling -> MLP -> ddG
+```
+
+- Structure-aware transformer using Chai-1 representations
+- Single embeddings as token features (384-dim projected to d_model)
+- Pair embeddings as learned attention biases (256-dim)
+- 4 transformer layers with 8 attention heads
+- Combined Huber + ranking loss for robust training
+- Processes all mutations for a protein in one forward pass
+
+### Shared Training Infrastructure
+
+All models use common utilities from `src/training/common.py`:
+
+- **`EmbeddingCache`**: Unified cache for protein embeddings with optional LRU eviction (prevents OOM on GPU)
+- **`TrainingHistory`**: Standardized training metrics tracking
+- **`EarlyStopping`**: Patience-based stopping with best model checkpointing
+- **`compute_metrics()`**: Per-protein Spearman/Pearson correlation computation
+- **`run_training()`**: Standard training loop with checkpointing and result saving
+
 ---
 
 ## Data
 
 ### Source
 
-**MegaScale** dataset from HuggingFace (`RosettaCommons/MegaScale`), config `dataset3_single_cv`:
+**MegaScale** dataset from HuggingFace (`RosettaCommons/MegaScale`):
 - ~271k unique single mutations
 - ~298 proteins (32-72 aa)
-- 5-fold CV splits (by protein, no leakage)
 - Standard benchmark from ThermoMPNN
 
 ### Splits
 
-Two split options are supported:
-- **HuggingFace CV splits**: Default 5-fold cross-validation from the dataset
-- **ThermoMPNN splits**: Official train/val/test splits from `mega_splits.pkl` for direct comparison with ThermoMPNN paper results
+Uses **ThermoMPNN's official splits** from `mega_splits.pkl`:
+- Main train/val/test split for final evaluation
+- Optional CV folds (0-4) for hyperparameter tuning
 
 ### Sign Convention
 
 MegaScale raw data uses **inverted** convention. Our code automatically flips to standard:
-- **Positive ΔΔG = destabilizing**
-- **Negative ΔΔG = stabilizing**
+- **Positive ddG = destabilizing**
+- **Negative ddG = stabilizing**
 
 ---
 
@@ -188,37 +185,36 @@ chai-thermo/
 │   ├── embeddings/
 │   │   └── chai_extractor.py   # Chai-1 trunk embedding extraction
 │   ├── features/
-│   │   └── mutation_encoder.py # encode_mutation() + EmbeddingCache
+│   │   └── mutation_encoder.py # encode_mutation() + EmbeddingCache (unified, LRU-capable)
 │   ├── models/
 │   │   ├── pair_aware_mlp.py   # PairAwareMLP with LayerNorms
-│   │   └── mpnn.py             # ChaiMPNN graph neural network
+│   │   ├── mpnn.py             # ChaiMPNN graph neural network
+│   │   └── transformer.py      # ChaiThermoTransformer
 │   └── training/
-│       ├── train.py            # MLP training loop + CV
-│       ├── train_mpnn.py       # MPNN training (supports ThermoMPNN splits)
+│       ├── common.py           # Shared: BaseTrainingConfig, EarlyStopping, TrainingHistory
+│       ├── evaluate.py         # Shared: compute_metrics(), EvaluationResults
+│       ├── train_mlp.py        # MLP training
+│       ├── train_mpnn.py       # MPNN training
+│       ├── train_transformer.py# Transformer training
 │       ├── eval_mpnn.py        # Per-protein MPNN evaluation
-│       ├── sampler.py          # BalancedProteinSampler
-│       └── evaluate.py         # Metrics computation
+│       └── sampler.py          # BalancedProteinSampler
+├── configs/
+│   └── transformer.yaml        # Example config file
 ├── scripts/
 │   ├── download_megascale.py   # Download dataset from HuggingFace
-│   ├── verify_alignment.py     # Pre-training sanity checks
-│   └── evaluate.py             # Evaluation + ablations
+│   └── verify_alignment.py     # Pre-training sanity checks
 ├── data/
 │   ├── megascale.parquet       # Local copy of MegaScale dataset
+│   ├── mega_splits.pkl         # ThermoMPNN train/val/test splits
 │   └── embeddings/
 │       └── chai_trunk/         # Cached embeddings ({protein}.pt)
 └── outputs/
-    ├── YYYYMMDD_HHMMSS_run_name/   # MPNN run directory
-    │   ├── config.json
-    │   ├── model.pt                # Final best model
-    │   ├── results.json            # Test metrics
-    │   ├── history.json            # Training history
-    │   ├── eval_test.csv           # Per-protein evaluation
-    │   └── checkpoint_epoch_*.pt   # Periodic checkpoints
-    ├── fold_0/                     # MLP fold directory
-    │   ├── model.pt
-    │   ├── config.json
-    │   └── results.json
-    └── cv_summary.json
+    └── YYYYMMDD_HHMMSS_run_name/   # Run directory (all models)
+        ├── config.json
+        ├── model.pt                # Final best model
+        ├── results.json            # Test metrics
+        ├── history.json            # Training history
+        └── checkpoint_epoch_*.pt   # Periodic checkpoints
 ```
 
 ---
@@ -239,6 +235,19 @@ Each protein produces a `.pt` file containing:
 - `pair`: `[L, L, 256]` pairwise interaction embeddings
 
 Total storage: ~426 MB for 298 proteins.
+
+**Loading embeddings in code:**
+```python
+from src.features.mutation_encoder import EmbeddingCache
+
+# CPU cache (unlimited)
+cache = EmbeddingCache("data/embeddings/chai_trunk")
+
+# GPU cache with LRU eviction (prevents OOM)
+cache = EmbeddingCache("data/embeddings/chai_trunk", device="cuda", max_cached=64)
+
+single, pair = cache.get("protein_name")
+```
 
 ---
 
@@ -266,7 +275,7 @@ Each epoch samples uniformly across proteins (32 mutations per protein), prevent
 Optional training augmentation that enforces physical reversibility:
 
 ```
-Loss = MSE(pred(A→B), ΔΔG) + MSE(pred(B→A), -ΔΔG) + λ·MSE(pred(A→B) + pred(B→A), 0)
+Loss = MSE(pred(A->B), ddG) + MSE(pred(B->A), -ddG) + lambda*MSE(pred(A->B) + pred(B->A), 0)
 ```
 
 **Why it helps:**
@@ -276,23 +285,6 @@ Loss = MSE(pred(A→B), ΔΔG) + MSE(pred(B→A), -ΔΔG) + λ·MSE(pred(A→B) 
 - Particularly effective on de novo designs where signal-to-noise is lower
 
 Enable with `--antisymmetric` flag. Adjust consistency weight with `--antisymmetric-lambda` (default: 1.0).
-
----
-
-## Ablation Studies
-
-To understand feature contributions:
-
-```bash
-uv run python scripts/evaluate.py --all-folds --ablation-suite
-```
-
-Available ablations:
-- `no-pair` — Single features only (ESM-style baseline)
-- `no-single` — Pair features only
-- `pair-global-only` — Only average pairwise interactions
-- `pair-structural-only` — Only top-k structural neighbors
-- `no-mutation-feat` — Remove WT/MUT identity
 
 ---
 

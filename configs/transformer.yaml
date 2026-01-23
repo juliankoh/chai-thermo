@@ -1,0 +1,43 @@
+# Chai-Thermo-Transformer Configuration
+# Structure-aware transformer with pair embeddings as attention biases
+
+model:
+  single_dim: 384       # Chai single embedding dim
+  pair_dim: 256         # Chai pair embedding dim
+  d_model: 256          # Transformer hidden dim
+  n_heads: 8            # Attention heads (32 dim per head)
+  n_layers: 4           # Transformer layers
+  d_ff: 512             # FFN hidden dim (2x d_model)
+  dropout: 0.1          # Dropout rate
+  site_hidden: 128      # Site head MLP hidden dim
+
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  epochs: 100
+  patience: 15          # Early stopping patience
+  gradient_clip: 1.0
+
+  loss:
+    huber_delta: 1.0    # Huber loss threshold
+    rank_weight: 0.1    # Weight for ranking loss (0 to disable)
+    rank_margin: 0.1    # Margin for ranking loss
+    n_rank_pairs: 256   # Pairs to sample per protein
+
+  scheduler:
+    T_0: 10             # CosineAnnealingWarmRestarts period
+    T_mult: 2           # Period multiplier
+
+data:
+  embedding_dir: "data/embeddings/chai_trunk"
+  data_path: "data/megascale.parquet"
+  embedding_cache_size: 64  # Proteins to keep on GPU
+
+evaluation:
+  metrics: [spearman, pearson, rmse, mae]
+  primary_metric: spearman
+  min_mutations: 10     # Min mutations per protein for metrics
+
+# Hardware
+device: "cuda"
+seed: 42

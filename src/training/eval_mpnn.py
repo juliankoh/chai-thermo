@@ -27,7 +27,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def load_model(run_dir: Path, device: str = "cuda") -> tuple[torch.nn.Module, MPNNTrainingConfig]:
+def load_model(
+    run_dir: Path, device: str = "cuda", checkpoint: str | None = None
+) -> tuple[torch.nn.Module, MPNNTrainingConfig]:
     """Load model and config from a run directory."""
     config = MPNNTrainingConfig.load(run_dir / "config.json")
 
@@ -52,12 +54,26 @@ def load_model(run_dir: Path, device: str = "cuda") -> tuple[torch.nn.Module, MP
             use_global_pool=config.use_global_pool,
         )
 
-    model_path = run_dir / "model.pt"
-    if not model_path.exists():
-        # Try fold_0 for CV runs
-        model_path = run_dir / "fold_0" / "model.pt"
+    # Determine model path
+    if checkpoint:
+        model_path = run_dir / checkpoint
+        if not model_path.exists():
+            model_path = Path(checkpoint)  # Try as absolute path
+    else:
+        model_path = run_dir / "model.pt"
+        if not model_path.exists():
+            # Try fold_0 for CV runs
+            model_path = run_dir / "fold_0" / "model.pt"
 
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    # Load weights (handle both checkpoint dict and raw state_dict)
+    # weights_only=False is fine for our own checkpoints
+    state = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(state, dict) and "model_state_dict" in state:
+        model.load_state_dict(state["model_state_dict"])
+        logger.info(f"Loaded checkpoint from epoch {state.get('epoch', '?')}")
+    else:
+        model.load_state_dict(state)
+
     model.to(device)
     model.eval()
 
@@ -177,12 +193,18 @@ def main():
         default=20,
         help="Show top N worst/best proteins in summary",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint filename to load (e.g., checkpoint_epoch_20.pt)",
+    )
 
     args = parser.parse_args()
     run_dir = Path(args.run_dir)
 
     # Load model and config
-    model, config = load_model(run_dir, args.device)
+    model, config = load_model(run_dir, args.device, args.checkpoint)
     device = torch.device(args.device)
 
     # Load dataset
