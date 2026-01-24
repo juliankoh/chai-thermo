@@ -3,8 +3,9 @@ Chai-Thermo-Transformer: Structure-Aware Transformer for ΔΔG Prediction.
 
 Uses Chai-1 single embeddings as sequence representation and pair embeddings
 as attention biases. Key features:
-- Gated pair bias (initialized to 0) for stable training
-- Zero-initialized bias projection to prevent attention collapse
+- Gated pair bias with learnable per-layer gates
+- Small random init on bias projection (enables gradient flow)
+- tanh + learnable scale to prevent attention collapse
 - 20-way site head with exact antisymmetry: ΔΔG = score[mut] - score[wt]
 - Vectorized readout for efficient protein-batch processing
 """
@@ -19,25 +20,33 @@ class PairBiasProjection(nn.Module):
     """
     Project pair embeddings to attention biases.
 
-    Output layer is zero-initialized so initial bias is ~0,
-    preventing attention collapse early in training.
+    Uses tanh + learnable scale for stable training:
+    - tanh clamps raw output to [-1, 1] preventing softmax saturation
+    - learnable bias_scale starts small (0.1) so model begins with
+      small but non-zero bias, learning to use structure if it helps
+
+    Output layer uses small random init (std=0.02) to ensure gradient flow.
     """
 
-    def __init__(self, pair_dim: int = 256, n_heads: int = 8):
+    def __init__(self, pair_dim: int = 256, n_heads: int = 8, init_scale: float = 0.1):
         super().__init__()
+        self.n_heads = n_heads
         self.net = nn.Sequential(
             nn.LayerNorm(pair_dim),
             nn.Linear(pair_dim, pair_dim // 4),
             nn.GELU(),
             nn.Linear(pair_dim // 4, n_heads),
         )
-        self._zero_init_output()
+        # Learnable scale per head, initialized small
+        # Shape: [n_heads, 1, 1] for broadcasting with [n_heads, L, L]
+        self.bias_scale = nn.Parameter(torch.full((n_heads, 1, 1), init_scale))
+        self._init_output()
 
-    def _zero_init_output(self):
-        """Zero-init the last layer so initial bias is ~0."""
+    def _init_output(self):
+        """Small random init so gradients can flow from the start."""
         last_linear = self.net[-1]
-        nn.init.zeros_(last_linear.weight)
-        nn.init.zeros_(last_linear.bias)
+        nn.init.normal_(last_linear.weight, std=0.02)
+        nn.init.zeros_(last_linear.bias)  # bias can stay zero
 
     def forward(self, pair: Tensor) -> Tensor:
         """
@@ -46,7 +55,11 @@ class PairBiasProjection(nn.Module):
         Returns:
             bias: [n_heads, L, L]
         """
-        return self.net(pair).permute(2, 0, 1)
+        raw = self.net(pair)           # [L, L, n_heads]
+        raw = raw.permute(2, 0, 1)     # [n_heads, L, L]
+        bias = torch.tanh(raw)         # clamp to [-1, 1]
+        bias = self.bias_scale * bias  # learnable scale per head
+        return bias
 
 
 class StructureAwareAttention(nn.Module):
@@ -213,8 +226,9 @@ class ChaiThermoTransformer(nn.Module):
 
     Key features:
     - Chai pair embeddings injected as gated attention biases
-    - Per-layer bias gates (initialized to 0)
-    - Zero-initialized bias projection
+    - Per-layer bias gates (initialized ~0.12 via sigmoid(-2))
+    - tanh + learnable scale on bias projection (prevents softmax saturation)
+    - Small random init on bias projection (enables gradient flow)
     - 20-way site head with exact antisymmetry
     - Vectorized readout for efficient protein-batch processing
 
@@ -252,9 +266,11 @@ class ChaiThermoTransformer(nn.Module):
         self.single_norm = nn.LayerNorm(d_model)
         self.pair_bias_proj = PairBiasProjection(pair_dim, n_heads)
 
-        # Per-layer bias gates (initialized to 0)
+        # Per-layer bias gate logits (sigmoid applied in forward)
+        # Initialized to -2 → sigmoid(-2) ≈ 0.12, so model starts mostly vanilla
+        # and learns to incorporate structure bias if helpful
         # Shape: [n_layers, n_heads, 1, 1]
-        self.bias_gates = nn.Parameter(torch.zeros(n_layers, n_heads, 1, 1))
+        self.bias_gate_logits = nn.Parameter(torch.full((n_layers, n_heads, 1, 1), -2.0))
 
         # Transformer layers
         self.layers = nn.ModuleList([
@@ -296,7 +312,7 @@ class ChaiThermoTransformer(nn.Module):
 
         # Transformer layers with gated pair bias
         for layer_idx, layer in enumerate(self.layers):
-            gate = self.bias_gates[layer_idx]  # [n_heads, 1, 1]
+            gate = torch.sigmoid(self.bias_gate_logits[layer_idx])  # [n_heads, 1, 1]
             h = layer(h, pair_bias, gate)
 
         h = self.final_norm(h)  # [L, d_model]
@@ -305,11 +321,16 @@ class ChaiThermoTransformer(nn.Module):
         return self.site_head(h, positions, wt_indices, mut_indices)
 
     def get_gate_values(self) -> dict:
-        """Return current gate values for logging/debugging."""
+        """Return current gate values (after sigmoid) for logging/debugging."""
+        gates = torch.sigmoid(self.bias_gate_logits)
         return {
-            f"layer_{i}": self.bias_gates[i].detach().squeeze().tolist()
+            f"layer_{i}": gates[i].detach().squeeze().tolist()
             for i in range(self.n_layers)
         }
+
+    def get_bias_scale_values(self) -> list:
+        """Return current bias scale values for logging/debugging."""
+        return self.pair_bias_proj.bias_scale.detach().squeeze().tolist()
 
     @property
     def num_parameters(self) -> int:

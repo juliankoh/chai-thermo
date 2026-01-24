@@ -206,7 +206,8 @@ def main():
     parser.add_argument("--fold", type=int, default=0, help="Fold to evaluate")
     parser.add_argument("--all-folds", action="store_true", help="Evaluate all available folds")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
-    parser.add_argument("--per-protein", action="store_true", help="Show per-protein breakdown")
+    parser.add_argument("--per-protein", action=argparse.BooleanOptionalAction, default=True,
+                        help="Show per-protein breakdown (use --no-per-protein to disable)")
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, help="Save results to JSON")

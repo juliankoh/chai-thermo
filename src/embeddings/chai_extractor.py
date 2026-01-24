@@ -91,7 +91,7 @@ class ChaiTrunkExtractor:
         sequence: str,
         protein_name: str = "protein",
         num_trunk_recycles: int = 3,
-        use_esm_embeddings: bool = True,
+        use_esm_embeddings: bool = False,
     ) -> ChaiEmbeddings:
         """
         Extract single and pair representations from Chai-1 trunk.
@@ -100,7 +100,7 @@ class ChaiTrunkExtractor:
             sequence: Amino acid sequence (single letter codes)
             protein_name: Identifier for the protein
             num_trunk_recycles: Number of trunk recycle iterations
-            use_esm_embeddings: Whether to use ESM embeddings (recommended)
+            use_esm_embeddings: Whether to use ESM embeddings (default: False, pure Chai)
 
         Returns:
             ChaiEmbeddings with single [L, D_single] and pair [L, L, D_pair] tensors
@@ -116,7 +116,7 @@ class ChaiTrunkExtractor:
                 fasta_file=fasta_path,
                 output_dir=tmp_path / "output",
                 use_esm_embeddings=use_esm_embeddings,
-                esm_device=self.device,  # ESM on same GPU
+                esm_device=self.device,  # Only used if use_esm_embeddings=True
                 use_msa_server=False,
                 use_templates_server=False,
             )
@@ -218,7 +218,7 @@ def extract_all_proteins(
     output_dir: Path,
     device: str = "cuda:0",
     num_trunk_recycles: int = 3,
-    use_esm_embeddings: bool = True,
+    use_esm_embeddings: bool = False,
     skip_existing: bool = True,
 ) -> None:
     """
@@ -229,7 +229,7 @@ def extract_all_proteins(
         output_dir: Directory to save embeddings
         device: CUDA device
         num_trunk_recycles: Number of trunk recycles
-        use_esm_embeddings: Whether to use ESM embeddings
+        use_esm_embeddings: Whether to use ESM embeddings (default: False)
         skip_existing: Skip proteins that already have embeddings
     """
     output_dir = Path(output_dir)
@@ -266,7 +266,7 @@ def worker(
     output_dir: Path,
     device: str = "cuda:0",
     num_trunk_recycles: int = 3,
-    use_esm_embeddings: bool = True,
+    use_esm_embeddings: bool = False,
 ) -> None:
     """Worker function for parallel processing across multiple GPUs/processes."""
     # Shard sequences for this worker
@@ -313,7 +313,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--device", default="cuda:0", help="CUDA device")
     parser.add_argument("--recycles", type=int, default=3, help="Number of trunk recycles")
-    parser.add_argument("--no-esm", action="store_true", help="Disable ESM embeddings")
+    parser.add_argument("--use-esm", action="store_true", help="Enable ESM embeddings (disabled by default)")
     parser.add_argument("--no-skip", action="store_true", help="Re-extract existing")
     parser.add_argument("--worker-id", type=int, default=0, help="Worker ID for parallel processing")
     parser.add_argument("--total-workers", type=int, default=1, help="Total number of workers")
@@ -335,7 +335,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             device=args.device,
             num_trunk_recycles=args.recycles,
-            use_esm_embeddings=not args.no_esm,
+            use_esm_embeddings=args.use_esm,
         )
     else:
         extract_all_proteins(
@@ -343,6 +343,6 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             device=args.device,
             num_trunk_recycles=args.recycles,
-            use_esm_embeddings=not args.no_esm,
+            use_esm_embeddings=args.use_esm,
             skip_existing=not args.no_skip,
         )

@@ -268,7 +268,8 @@ def main():
                         choices=["no-pair", "no-single", "pair-global-only",
                                 "pair-structural-only", "single-only", "no-mutation-feat"])
     parser.add_argument("--ablation-suite", action="store_true", help="Run all ablations")
-    parser.add_argument("--per-protein", action="store_true", help="Show per-protein breakdown")
+    parser.add_argument("--per-protein", action=argparse.BooleanOptionalAction, default=True,
+                        help="Show per-protein breakdown (use --no-per-protein to disable)")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", type=Path, help="Save results to JSON")
 

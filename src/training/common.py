@@ -323,17 +323,18 @@ def log_epoch(
     total_epochs: int,
     train_loss: float,
     val_results: Optional[EvaluationResults] = None,
+    prefix: str = "",
 ) -> None:
     """Log epoch progress."""
     if val_results is not None:
         logger.info(
-            f"Epoch {epoch + 1}/{total_epochs} | "
+            f"{prefix}Epoch {epoch + 1}/{total_epochs} | "
             f"Loss: {train_loss:.4f} | "
             f"Val Spearman: {val_results.mean_spearman:.4f} | "
             f"Val RMSE: {val_results.rmse:.4f}"
         )
     else:
-        logger.info(f"Epoch {epoch + 1}/{total_epochs} | Loss: {train_loss:.4f}")
+        logger.info(f"{prefix}Epoch {epoch + 1}/{total_epochs} | Loss: {train_loss:.4f}")
 
 
 # =============================================================================
@@ -380,6 +381,23 @@ def run_training(
     # Save model and results
     torch.save(model.state_dict(), run_dir / "model.pt")
 
+    # Build comprehensive evaluation dict
+    eval_dict = {
+        "test_results": test_results.to_dict(),
+    }
+
+    # Add model info if available (gates, scales for transformer)
+    if hasattr(model, "get_gate_values"):
+        eval_dict["model_info"] = {
+            "bias_gates": model.get_gate_values(),
+            "bias_scales": model.get_bias_scale_values() if hasattr(model, "get_bias_scale_values") else None,
+            "num_parameters": model.num_parameters if hasattr(model, "num_parameters") else None,
+        }
+
+    with open(run_dir / "eval.json", "w") as f:
+        json.dump(eval_dict, f, indent=2)
+
+    # Also save legacy results.json for backwards compatibility
     with open(run_dir / "results.json", "w") as f:
         json.dump(test_results.to_dict(), f, indent=2)
 
@@ -388,5 +406,6 @@ def run_training(
         json.dump(history_dict, f, indent=2)
 
     logger.info(f"\nResults saved to: {run_dir}")
+    logger.info(f"  - model.pt, config.json, eval.json, history.json")
 
     return run_dir, model, test_results, history

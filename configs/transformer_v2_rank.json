@@ -1,0 +1,45 @@
+{
+  "run_name": "transformer_v2_rank",
+  "model_type": "transformer_clean_v2",
+  "splits_file": "data/mega_splits.pkl",
+  "cv_fold": null,
+  "embedding_dir": "data/embeddings/chai_trunk",
+  "data_path": "data/megascale.parquet",
+
+  "single_dim": 384,
+  "pair_dim": 256,
+  "d_model": 384,
+  "n_heads": 8,
+  "n_layers": 4,
+  "d_ff": 1024,
+  "dropout": 0.1,
+  "site_hidden": 128,
+
+  "learning_rate": 0.0003,
+  "min_lr": 1e-6,
+  "warmup_steps": 1000,
+  "weight_decay": 0.01,
+
+  "epochs": 100,
+  "patience": 20,
+  "gradient_clip": 1.0,
+  "eval_interval": 5,
+  "accumulation_steps": 1,
+
+  "huber_delta": 1.0,
+  "antisymmetric": true,
+  "antisym_lambda": 1.0,
+
+  "rank_weight": 0.02,
+  "rank_margin": 0.1,
+  "n_rank_pairs": 512,
+
+  "loss_weighting": "mutation",
+
+  "embedding_cache_size": 64,
+  "min_mutations_eval": 10,
+
+  "device": "cuda",
+  "seed": 42,
+  "output_dir": "outputs"
+}
