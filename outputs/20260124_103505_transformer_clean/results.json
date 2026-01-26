@@ -1,0 +1,16 @@
+{
+  "mean_spearman": 0.7455092897708034,
+  "std_spearman": 0.0903328801567738,
+  "median_spearman": 0.7808720114102902,
+  "weighted_spearman": 0.7427948156242163,
+  "mean_pearson": 0.7977741652923831,
+  "std_pearson": 0.08972669576024492,
+  "median_pearson": 0.8269759636522276,
+  "weighted_pearson": 0.7968094235232757,
+  "global_spearman": 0.7119898758513764,
+  "global_pearson": 0.7609458532680604,
+  "rmse": 0.7092264196116818,
+  "mae": 0.5271551212657278,
+  "n_proteins": 28,
+  "n_mutations": 28172
+}

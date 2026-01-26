@@ -52,5 +52,3 @@ wandb/
 .DS_Store
 Thumbs.db
 chai-lab/
-
-outputs/
