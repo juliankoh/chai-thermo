@@ -10,15 +10,23 @@ Uses ThermoMPNN's official data splits for training and evaluation.
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - Pre-extracted Chai-1 embeddings in `data/embeddings/chai_trunk/`
 - ThermoMPNN splits file (`data/mega_splits.pkl`)
 
 ### Installation
 
 ```bash
-uv sync  # or pip install -r requirements.txt
+uv sync  # recommended
+
+# or with pip (no requirements.txt provided)
+pip install .        # install as a package
+# pip install -e .   # editable install for development
 ```
+
+Notes:
+- If you don’t have `uv`: pipx install uv (or `pip install uv`).
+- `torch-geometric` may require CUDA-specific wheels. If installation fails, follow: https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
 
 ### Download Data
 
@@ -29,12 +37,36 @@ uv run python scripts/download_megascale.py
 
 This creates `data/megascale.parquet` which is used by training/eval scripts.
 
+### ThermoMPNN Splits (required)
+
+- Download the official ThermoMPNN splits file `mega_splits.pkl` from the ThermoMPNN repository and place it at `data/mega_splits.pkl`.
+- The same file also contains optional CV folds (`cv_train_{0-4}`/`cv_val_{0-4}`/`cv_test_{0-4}`).
+
+Example layout:
+```
+data/
+  megascale.parquet
+  mega_splits.pkl
+```
+
 ### Training
+
+This repo supports three training modes:
+
+1) MLP — fast baseline using pre-encoded features
+2) MPNN — graph neural network over local structural subgraphs
+3) Transformer — structure-aware transformer using pair biases
 
 **MLP Model:**
 ```bash
 uv run python -m src.training.train_mlp --run-name mlp_baseline
 ```
+
+Key options:
+- `--precomputed-dir PATH` to train from precomputed features (see Precomputation below)
+- `--splits-file PATH` (default `data/mega_splits.pkl`)
+- `--cv-fold N` (0–4) for CV splits, or omit for main split
+- `--run-name NAME`
 
 **MPNN Model:**
 ```bash
@@ -45,18 +77,23 @@ uv run python -m src.training.train_mpnn --run-name mpnn_baseline
 uv run python -m src.training.train_mpnn \
     --run-name mpnn_antisym \
     --antisymmetric \
-    --batch-size 1024
+    --batch-size 128
 ```
+
+Key options:
+- `--data-path PATH` to use local parquet (faster repeated access)
+- `--splits-file PATH` (default `data/mega_splits.pkl`)
+- `--cv-fold N` (0–4), `--run-name NAME`
 
 **Transformer Model:**
 ```bash
 uv run python -m src.training.train_transformer --run-name transformer_baseline
 ```
 
-All training scripts support:
-- `--splits-file PATH` - Path to mega_splits.pkl (default: `data/mega_splits.pkl`)
-- `--cv-fold N` - Use CV fold 0-4 within splits, or omit for main split
-- `--run-name NAME` - Name for this training run
+Key options:
+- `--data-path PATH` to use local parquet (faster)
+- `--splits-file PATH` (default `data/mega_splits.pkl`)
+- `--cv-fold N` (0–4), `--run-name NAME`
 
 ### Evaluation
 
@@ -69,11 +106,23 @@ uv run python -m src.training.eval_mpnn outputs/YYYYMMDD_HHMMSS_run_name/
 uv run python -m src.training.eval_mpnn outputs/run_dir/ --split val --sort-by rmse
 ```
 
+**Transformer evaluation:**
+```bash
+uv run python scripts/evaluate_transformer.py \
+  --config configs/transformer.yaml \
+  --splits-file data/mega_splits.pkl \
+  --model-path outputs/run_dir/model.pt
+```
+
 ### Verification (run before training)
 
 ```bash
 uv run python scripts/verify_alignment.py --embedding-dir data/embeddings/chai_trunk
 ```
+
+Useful flags:
+- `--fold -1` to check all folds
+- `--show-stats` to print per-embedding shape/stats
 
 ---
 
@@ -236,6 +285,27 @@ Each protein produces a `.pt` file containing:
 
 Total storage: ~426 MB for 298 proteins.
 
+### Creating `data/wt_sequences.json`
+
+If you don’t already have WT sequences, you can extract them from the MegaScale data restricted to ThermoMPNN splits:
+
+```bash
+uv run python - <<'PY'
+from pathlib import Path
+import json
+from src.data.megascale_loader import ThermoMPNNSplitDatasetHF
+
+splits = 'data/mega_splits.pkl'
+ds = ThermoMPNNSplitDatasetHF(splits_file=splits, split='train')
+# Normalize names and materialize dict
+seqs = {k.replace('.pdb',''): v for k,v in ds.wt_sequences.items()}
+Path('data').mkdir(exist_ok=True)
+with open('data/wt_sequences.json','w') as f:
+    json.dump(seqs, f)
+print(f'wrote {len(seqs)} sequences to data/wt_sequences.json')
+PY
+```
+
 **Loading embeddings in code:**
 ```python
 from src.features.mutation_encoder import EmbeddingCache
@@ -268,7 +338,7 @@ single, pair = cache.get("protein_name")
 
 ### Balanced Sampling
 
-Each epoch samples uniformly across proteins (32 mutations per protein), preventing large proteins from dominating gradients.
+For the MLP training path, each epoch samples uniformly across proteins (32 mutations per protein), preventing large proteins from dominating gradients.
 
 ### Antisymmetric Loss (MPNN)
 
@@ -288,6 +358,31 @@ Enable with `--antisymmetric` flag. Adjust consistency weight with `--antisymmet
 
 ---
 
+## Top Results
+
+Best runs per model class on ThermoMPNN splits:
+
+- MLP (PairAwareMLP, ~5M):
+  - Spearman: 0.7218, RMSE: 0.7175
+  - Params: ~5,017,217
+  - Run: `outputs/20260126_205313_mlp_5m`
+
+- MPNN (ChaiMPNN, antisymmetric):
+  - Spearman: 0.7683, RMSE: 0.6982
+  - Params: ~5,271,105
+  - Run: `outputs/20260122_054138_mpnn_antisym_scaled`
+
+- Transformer (ChaiThermoTransformer v2 + ranking):
+  - Spearman: 0.7456, RMSE: 0.7004
+  - Params: ~5,797,956
+  - Run: `outputs/20260124_084950_transformer_v2_rank`
+
+Notes:
+- Primary metric is mean per-protein Spearman (higher is better).
+- RMSE reported on the same splits for comparability.
+
+---
+
 ## Known Limitations
 
 1. **Domain size**: Trained on 32-72 aa proteins; may not generalize to larger domains
@@ -303,4 +398,4 @@ If you use this work, please cite:
 
 - **Chai-1**: [Chai Discovery](https://chaidiscovery.com)
 - **MegaScale**: Tsuboyama et al., "Mega-scale experimental analysis of protein folding stability in biology and design" (2023)
-- **ThermoMPNN**: [Reference for benchmark splits]
+- **ThermoMPNN**: Add the official ThermoMPNN citation and GitHub link for benchmark splits

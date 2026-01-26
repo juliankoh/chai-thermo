@@ -18,7 +18,10 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from src.data.dataset import collate_mutations
-from src.data.megascale_loader import ThermoMPNNSplitDatasetHF
+from src.data.megascale_loader import (
+    ThermoMPNNSplitDatasetHF,
+    ThermoMPNNSplitDatasetParquet,
+)
 from src.features.mutation_encoder import EmbeddingCache, encode_batch
 from src.models.pair_aware_mlp import PairAwareMLP
 from src.training.common import (
@@ -246,15 +249,34 @@ def train(
             else:
                 logger.info("Using main train/val/test split")
 
-        train_dataset = ThermoMPNNSplitDatasetHF(
-            config.splits_file, split="train", cv_fold=config.cv_fold
-        )
-        val_dataset = ThermoMPNNSplitDatasetHF(
-            config.splits_file, split="val", cv_fold=config.cv_fold
-        )
-        test_dataset = ThermoMPNNSplitDatasetHF(
-            config.splits_file, split="test", cv_fold=config.cv_fold
-        )
+        # Prefer local parquet if available to avoid network fetch
+        from pathlib import Path
+        if config.data_path and Path(config.data_path).exists():
+            if verbose:
+                logger.info(f"Using local parquet at {config.data_path}")
+            train_dataset = ThermoMPNNSplitDatasetParquet(
+                config.splits_file, split="train", cv_fold=config.cv_fold, data_path=config.data_path
+            )
+            val_dataset = ThermoMPNNSplitDatasetParquet(
+                config.splits_file, split="val", cv_fold=config.cv_fold, data_path=config.data_path
+            )
+            test_dataset = ThermoMPNNSplitDatasetParquet(
+                config.splits_file, split="test", cv_fold=config.cv_fold, data_path=config.data_path
+            )
+        else:
+            if verbose and config.data_path:
+                logger.info(
+                    f"Local parquet not found at {config.data_path}; falling back to HuggingFace dataset"
+                )
+            train_dataset = ThermoMPNNSplitDatasetHF(
+                config.splits_file, split="train", cv_fold=config.cv_fold
+            )
+            val_dataset = ThermoMPNNSplitDatasetHF(
+                config.splits_file, split="val", cv_fold=config.cv_fold
+            )
+            test_dataset = ThermoMPNNSplitDatasetHF(
+                config.splits_file, split="test", cv_fold=config.cv_fold
+            )
 
         if verbose:
             logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -396,6 +418,8 @@ def main():
     parser.add_argument("--cv-fold", type=int, default=None,
                         help="CV fold (0-4) within splits, or None for main split")
     parser.add_argument("--embedding-dir", type=str, default="data/embeddings/chai_trunk")
+    parser.add_argument("--data-path", type=str, default="data/megascale.parquet",
+                        help="Path to local MegaScale parquet file (uses local if exists)")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--precomputed-dir", type=str, default=None,
                         help="Path to precomputed features (use scripts/precompute.py to generate)")
@@ -422,6 +446,7 @@ def main():
         splits_file=args.splits_file,
         cv_fold=args.cv_fold,
         embedding_dir=args.embedding_dir,
+        data_path=args.data_path,
         output_dir=args.output_dir,
         precomputed_dir=args.precomputed_dir,
         epochs=args.epochs,
